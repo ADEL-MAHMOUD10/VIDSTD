@@ -1,0 +1,681 @@
+{
+  "version": "IMGSTD::V04",
+  "description": "Master Standard Semantic Vocabulary for Zero-Vision AI Inspection (V04: COCO-80 + Architectural Structures + Fast Multilingual OCR)",
+  "classes": {
+    "0000": {
+      "name": "Unclassified / Background",
+      "category": "General",
+      "description": "Unassigned background or general scene backdrop"
+    },
+    "0001": {
+      "name": "Person (Human)",
+      "category": "Humans",
+      "description": "Full human figure or general person"
+    },
+    "0002": {
+      "name": "Bicycle (Transport)",
+      "category": "Transport",
+      "description": "Two-wheeled non-motorized pedal bicycle"
+    },
+    "0003": {
+      "name": "Car / Automobile (Transport)",
+      "category": "Transport",
+      "description": "Passenger car, sedan, or automobile"
+    },
+    "0004": {
+      "name": "Motorcycle (Transport)",
+      "category": "Transport",
+      "description": "Motorcycle, motorbike, or scooter"
+    },
+    "0005": {
+      "name": "Airplane (Transport)",
+      "category": "Transport",
+      "description": "Aircraft, airplane, or jet"
+    },
+    "0010": {
+      "name": "Traffic Light (Infrastructure)",
+      "category": "Infrastructure",
+      "description": "Road intersection traffic signal light"
+    },
+    "0011": {
+      "name": "Fire Hydrant (Infrastructure)",
+      "category": "Infrastructure",
+      "description": "Street emergency fire hydrant"
+    },
+    "0012": {
+      "name": "Stop Sign (Infrastructure)",
+      "category": "Infrastructure",
+      "description": "Octagonal street stop sign"
+    },
+    "0013": {
+      "name": "Parking Meter (Infrastructure)",
+      "category": "Infrastructure",
+      "description": "Street parking payment meter"
+    },
+    "0014": {
+      "name": "Bench (Furniture)",
+      "category": "Furniture",
+      "description": "Outdoor or park seating bench"
+    },
+    "0015": {
+      "name": "Bird (Animal)",
+      "category": "Animals",
+      "description": "Avian bird of any species"
+    },
+    "0016": {
+      "name": "Bird (Animal)",
+      "category": "Animals",
+      "description": "Avian bird of any species (Alias)"
+    },
+    "0017": {
+      "name": "Cat (Animal)",
+      "category": "Animals",
+      "description": "Domestic or feline cat"
+    },
+    "0020": {
+      "name": "Sheep (Animal)",
+      "category": "Animals",
+      "description": "Ovine sheep or lamb"
+    },
+    "0021": {
+      "name": "Cow (Animal)",
+      "category": "Animals",
+      "description": "Bovine cow or cattle"
+    },
+    "0022": {
+      "name": "Elephant (Animal)",
+      "category": "Animals",
+      "description": "Wild or captive elephant"
+    },
+    "0023": {
+      "name": "Bear (Animal)",
+      "category": "Animals",
+      "description": "Bear"
+    },
+    "0024": {
+      "name": "Zebra (Animal)",
+      "category": "Animals",
+      "description": "Zebra"
+    },
+    "0030": {
+      "name": "Suitcase (Apparel)",
+      "category": "Apparel",
+      "description": "Travel luggage suitcase"
+    },
+    "0031": {
+      "name": "Frisbee (Sports)",
+      "category": "Sports",
+      "description": "Flying disc or frisbee"
+    },
+    "0032": {
+      "name": "Skis (Sports)",
+      "category": "Sports",
+      "description": "Snow skis pair"
+    },
+    "0033": {
+      "name": "Snowboard (Sports)",
+      "category": "Sports",
+      "description": "Snowboard"
+    },
+    "0034": {
+      "name": "Sports Ball (Sports)",
+      "category": "Sports",
+      "description": "Sports ball (soccer, basketball, etc.)"
+    },
+    "0035": {
+      "name": "Kite (Sports)",
+      "category": "Sports",
+      "description": "Wind flying kite"
+    },
+    "0040": {
+      "name": "Tennis Racket (Sports)",
+      "category": "Sports",
+      "description": "Tennis racket"
+    },
+    "0041": {
+      "name": "Bottle (Kitchen)",
+      "category": "Kitchen",
+      "description": "Glass or plastic bottle"
+    },
+    "0042": {
+      "name": "Wine Glass (Kitchen)",
+      "category": "Kitchen",
+      "description": "Stemmed wine glass"
+    },
+    "0043": {
+      "name": "Cup (Kitchen)",
+      "category": "Kitchen",
+      "description": "Coffee cup or drinking mug"
+    },
+    "0050": {
+      "name": "Sandwich (Food)",
+      "category": "Food",
+      "description": "Sandwich or hamburger"
+    },
+    "0051": {
+      "name": "Orange (Food)",
+      "category": "Food",
+      "description": "Orange citrus fruit"
+    },
+    "0052": {
+      "name": "Broccoli (Food)",
+      "category": "Food",
+      "description": "Broccoli vegetable florets"
+    },
+    "0053": {
+      "name": "Carrot (Food)",
+      "category": "Food",
+      "description": "Carrot root vegetable"
+    },
+    "0054": {
+      "name": "Hot Dog (Food)",
+      "category": "Food",
+      "description": "Frankfurter hot dog in bun"
+    },
+    "0055": {
+      "name": "Pizza (Food)",
+      "category": "Food",
+      "description": "Baked pizza pie or slice"
+    },
+    "0060": {
+      "name": "Bed (Furniture)",
+      "category": "Furniture",
+      "description": "Sleeping bed with mattress"
+    },
+    "0061": {
+      "name": "Dining Table (Furniture)",
+      "category": "Furniture",
+      "description": "Dining, conference, or kitchen table"
+    },
+    "0062": {
+      "name": "Toilet (Sanitary)",
+      "category": "Sanitary",
+      "description": "Bathroom flush toilet fixture"
+    },
+    "0063": {
+      "name": "Laptop / Computer (Electronics)",
+      "category": "Electronics",
+      "description": "Laptop personal computer"
+    },
+    "0064": {
+      "name": "TV / Monitor (Electronics)",
+      "category": "Electronics",
+      "description": "Television screen or computer monitor"
+    },
+    "0070": {
+      "name": "Oven (Appliance)",
+      "category": "Appliance",
+      "description": "Kitchen baking oven or stove"
+    },
+    "0071": {
+      "name": "Toaster (Appliance)",
+      "category": "Appliance",
+      "description": "Bread slot toaster"
+    },
+    "0072": {
+      "name": "Sink (Sanitary)",
+      "category": "Sanitary",
+      "description": "Kitchen or bathroom wash sink"
+    },
+    "0073": {
+      "name": "Refrigerator (Appliance)",
+      "category": "Appliance",
+      "description": "Kitchen refrigerator freezer"
+    },
+    "0080": {
+      "name": "Toothbrush (Hygiene)",
+      "category": "Hygiene",
+      "description": "Manual or electric toothbrush"
+    },
+    "0081": {
+      "name": "Fruit / Vegetable",
+      "category": "Food & Goods",
+      "description": "Fresh produce, fruit, vegetable"
+    },
+    "0082": {
+      "name": "Bottle / Beverage",
+      "category": "Food & Goods",
+      "description": "Drink container, bottle, can"
+    },
+    "0089": {
+      "name": "Car / Automobile",
+      "category": "Transport",
+      "description": "Passenger car, sedan, SUV"
+    },
+    "0090": {
+      "name": "Bus / Public Transit",
+      "category": "Transport",
+      "description": "Passenger bus or coach"
+    },
+    "0091": {
+      "name": "Truck / Heavy Transport",
+      "category": "Transport",
+      "description": "Cargo truck, lorry, hauler"
+    },
+    "0100": {
+      "name": "Clothing / Apparel",
+      "category": "Apparel",
+      "description": "Garment or textile wear"
+    },
+    "0101": {
+      "name": "Shirt / Top / Jacket",
+      "category": "Apparel",
+      "description": "Upper body outerwear"
+    },
+    "0102": {
+      "name": "Pants / Trousers / Skirt",
+      "category": "Apparel",
+      "description": "Lower body apparel"
+    },
+    "0103": {
+      "name": "Shoes / Footwear",
+      "category": "Apparel",
+      "description": "Sneakers, boots, shoes"
+    },
+    "0110": {
+      "name": "Text / Typography",
+      "category": "Graphic",
+      "description": "Text block, letters, caption"
+    },
+    "0111": {
+      "name": "Logo / Icon / Emblem",
+      "category": "Graphic",
+      "description": "Graphic symbol, branding badge"
+    },
+    "0112": {
+      "name": "Document / Page / Paper",
+      "category": "Graphic",
+      "description": "Paper sheet, book, invoice, form"
+    },
+    "0006": {
+      "name": "Bus (Transport)",
+      "category": "Transport",
+      "description": "Public transit or charter bus"
+    },
+    "0007": {
+      "name": "Train (Transport)",
+      "category": "Transport",
+      "description": "Rail train or locomotive"
+    },
+    "0008": {
+      "name": "Truck (Transport)",
+      "category": "Transport",
+      "description": "Cargo truck or semi-trailer"
+    },
+    "0009": {
+      "name": "Boat (Transport)",
+      "category": "Transport",
+      "description": "Water vessel, boat, or ship"
+    },
+    "0018": {
+      "name": "Dog (Animal)",
+      "category": "Animals",
+      "description": "Domestic canine dog"
+    },
+    "0019": {
+      "name": "Horse (Animal)",
+      "category": "Animals",
+      "description": "Equine horse or pony"
+    },
+    "0025": {
+      "name": "Giraffe (Animal)",
+      "category": "Animals",
+      "description": "Giraffe"
+    },
+    "0026": {
+      "name": "Backpack (Apparel)",
+      "category": "Apparel",
+      "description": "Backpack or schoolbag"
+    },
+    "0027": {
+      "name": "Umbrella (Apparel)",
+      "category": "Apparel",
+      "description": "Rain or sun umbrella"
+    },
+    "0028": {
+      "name": "Handbag (Apparel)",
+      "category": "Apparel",
+      "description": "Handbag or purse"
+    },
+    "0029": {
+      "name": "Tie (Apparel)",
+      "category": "Apparel",
+      "description": "Necktie or bow tie"
+    },
+    "0036": {
+      "name": "Baseball Bat (Sports)",
+      "category": "Sports",
+      "description": "Baseball or softball bat"
+    },
+    "0037": {
+      "name": "Baseball Glove (Sports)",
+      "category": "Sports",
+      "description": "Baseball fielding glove"
+    },
+    "0038": {
+      "name": "Skateboard (Sports)",
+      "category": "Sports",
+      "description": "Wheeled skateboard"
+    },
+    "0039": {
+      "name": "Surfboard (Sports)",
+      "category": "Sports",
+      "description": "Water surfboard"
+    },
+    "0044": {
+      "name": "Fork (Kitchen)",
+      "category": "Kitchen",
+      "description": "Dining fork"
+    },
+    "0045": {
+      "name": "Knife (Kitchen)",
+      "category": "Kitchen",
+      "description": "Table or kitchen knife"
+    },
+    "0046": {
+      "name": "Spoon (Kitchen)",
+      "category": "Kitchen",
+      "description": "Eating spoon"
+    },
+    "0047": {
+      "name": "Bowl (Kitchen)",
+      "category": "Kitchen",
+      "description": "Soup or cereal bowl"
+    },
+    "0048": {
+      "name": "Banana (Food)",
+      "category": "Food",
+      "description": "Banana fruit"
+    },
+    "0049": {
+      "name": "Apple (Food)",
+      "category": "Food",
+      "description": "Fresh apple fruit"
+    },
+    "0056": {
+      "name": "Donut (Food)",
+      "category": "Food",
+      "description": "Sweet glazed or frosted donut"
+    },
+    "0057": {
+      "name": "Chair (Furniture)",
+      "category": "Furniture",
+      "description": "Single seated chair or stool"
+    },
+    "0058": {
+      "name": "Couch / Sofa (Furniture)",
+      "category": "Furniture",
+      "description": "Upholstered living room sofa or couch"
+    },
+    "0059": {
+      "name": "Potted Plant (Decor)",
+      "category": "Decor",
+      "description": "Houseplant in decorative pot"
+    },
+    "0065": {
+      "name": "Mouse (Electronics)",
+      "category": "Electronics",
+      "description": "Computer optical or wireless mouse"
+    },
+    "0066": {
+      "name": "Remote Control (Electronics)",
+      "category": "Electronics",
+      "description": "Electronic remote control handset"
+    },
+    "0067": {
+      "name": "Keyboard (Electronics)",
+      "category": "Electronics",
+      "description": "Computer typing keyboard"
+    },
+    "0068": {
+      "name": "Cell Phone (Electronics)",
+      "category": "Electronics",
+      "description": "Cellular mobile smartphone"
+    },
+    "0069": {
+      "name": "Microwave (Appliance)",
+      "category": "Appliance",
+      "description": "Countertop microwave oven"
+    },
+    "0074": {
+      "name": "Book (Media)",
+      "category": "Media",
+      "description": "Bound paper book or novel"
+    },
+    "0075": {
+      "name": "Clock (Decor)",
+      "category": "Decor",
+      "description": "Wall, desk, or mantle clock"
+    },
+    "0076": {
+      "name": "Vase (Decor)",
+      "category": "Decor",
+      "description": "Decorative floral vase"
+    },
+    "0077": {
+      "name": "Scissors (Tools)",
+      "category": "Tools",
+      "description": "Handheld cutting scissors"
+    },
+    "0078": {
+      "name": "Teddy Bear (Toys)",
+      "category": "Toys",
+      "description": "Stuffed plush teddy bear"
+    },
+    "0079": {
+      "name": "Hair Drier (Appliance)",
+      "category": "Appliance",
+      "description": "Blow dry electric hair styling tool"
+    },
+    "0080": {
+      "name": "Toothbrush (Personal Care)",
+      "category": "Personal Care",
+      "description": "Bristled manual or electric toothbrush"
+    },
+    "0082": {
+      "name": "Cake (Food)",
+      "category": "Food",
+      "description": "Baked cake or pastry"
+    },
+    "0100": {
+      "name": "Building / Architecture",
+      "category": "Architecture",
+      "description": "General architectural building or exterior structural facade"
+    },
+    "0101": {
+      "name": "Building / Storefront Facade",
+      "category": "Architecture",
+      "description": "Commercial shopfront, building facade, or store entrance"
+    },
+    "0102": {
+      "name": "Door / Entrance",
+      "category": "Architecture",
+      "description": "Doorway, entrance gate, or glass entry door"
+    },
+    "0103": {
+      "name": "Window / Glass Panel",
+      "category": "Architecture",
+      "description": "Glass window pane, showcase window, or glazed architectural panel"
+    },
+    "0104": {
+      "name": "Stairs / Steps",
+      "category": "Architecture",
+      "description": "Exterior or interior stairs, steps, or elevated entryway threshold"
+    },
+    "0105": {
+      "name": "Signboard / Banner",
+      "category": "Signage",
+      "description": "Commercial signboard, banner, billboard, or mounted text placard"
+    },
+    "0106": {
+      "name": "Wall / Pillar",
+      "category": "Architecture",
+      "description": "Exterior or interior structural wall, column, or pillar"
+    },
+    "0107": {
+      "name": "Floor / Pavement",
+      "category": "Infrastructure",
+      "description": "Pedestrian sidewalk, paved ground, or street curb"
+    },
+    "0108": {
+      "name": "Roof / Awning / Canopy",
+      "category": "Architecture",
+      "description": "Roof overhang, fabric awning, or protective entrance canopy"
+    },
+    "0109": {
+      "name": "Ceiling / Overhead Surface",
+      "category": "Architecture",
+      "description": "Indoor ceiling or architectural overhead plane"
+    },
+    "0110": {
+      "name": "Counter / Reception Desk",
+      "category": "Indoor",
+      "description": "Service counter, cashier desk, or reception station"
+    },
+    "0111": {
+      "name": "Shelf / Display Rack",
+      "category": "Indoor",
+      "description": "Merchandise shelf, bookcase, or display shelving"
+    },
+    "0112": {
+      "name": "Fence / Barrier / Railing",
+      "category": "Architecture",
+      "description": "Protective guard rail, perimeter fence, or handrail"
+    },
+    "0120": {
+      "name": "UI Button / Control",
+      "category": "User Interface",
+      "description": "Clickable user interface button, toggle, or control"
+    },
+    "0121": {
+      "name": "UI Text Field / Input",
+      "category": "User Interface",
+      "description": "Text input box, search bar, or form input element"
+    },
+    "0122": {
+      "name": "UI Navigation Bar / Header",
+      "category": "User Interface",
+      "description": "Top navigation header, menu bar, or breadcrumb strip"
+    },
+    "0123": {
+      "name": "UI Icon / Glyph",
+      "category": "User Interface",
+      "description": "Vector icon, symbol, or status indicator graphic"
+    },
+    "0124": {
+      "name": "UI Card / Container",
+      "category": "User Interface",
+      "description": "Bounded content card, panel, or widget container"
+    },
+    "0125": {
+      "name": "UI Dialog / Modal",
+      "category": "User Interface",
+      "description": "Popup modal dialog, alert box, or overlay panel"
+    },
+    "0201": {
+      "name": "Planet Earth / Globe (Celestial)",
+      "category": "Celestial & Space",
+      "description": "Planet Earth, global planetary sphere, or orbital world view"
+    },
+    "0202": {
+      "name": "Planet / Exoplanet (Celestial)",
+      "category": "Celestial & Space",
+      "description": "Planetary body or exoplanet in space"
+    },
+    "0203": {
+      "name": "Moon / Lunar Body (Celestial)",
+      "category": "Celestial & Space",
+      "description": "Natural planetary moon or lunar celestial body"
+    },
+    "0204": {
+      "name": "Sun / Star (Celestial)",
+      "category": "Celestial & Space",
+      "description": "Stellar object, solar sphere, or bright star"
+    },
+    "0205": {
+      "name": "Galaxy / Milky Way (Celestial)",
+      "category": "Celestial & Space",
+      "description": "Spiral galaxy, interstellar star cluster, or Milky Way view"
+    },
+    "0206": {
+      "name": "Outer Space / Deep Space (Celestial)",
+      "category": "Celestial & Space",
+      "description": "Cosmic void, starfield, or deep space backdrop"
+    },
+    "0207": {
+      "name": "Satellite / Spacecraft (Spacecraft)",
+      "category": "Spacecraft",
+      "description": "Artificial orbital satellite, probe, or space station"
+    },
+    "0208": {
+      "name": "Nebula / Cosmic Cloud (Celestial)",
+      "category": "Celestial & Space",
+      "description": "Glowing interstellar dust, nebula, or ionized gas cloud"
+    },
+    "0209": {
+      "name": "Atmosphere / Planetary Limb (Atmosphere)",
+      "category": "Atmosphere",
+      "description": "Planetary atmospheric curve, halo, or limb glow"
+    },
+    "0210": {
+      "name": "Continent / Landmass (Geography)",
+      "category": "Geography",
+      "description": "Continental landmass, shoreline, or terrain visible from orbit"
+    },
+    "0211": {
+      "name": "Ocean / Sea (Geography)",
+      "category": "Geography",
+      "description": "Planetary ocean basin, sea, or global water body"
+    },
+    "0251": {
+      "name": "Microscope / Scientific Equipment (Scientific)",
+      "category": "Scientific",
+      "description": "Optical/electron microscope or laboratory research apparatus"
+    },
+    "0252": {
+      "name": "Biological Cell / Organelle (Biology)",
+      "category": "Biology",
+      "description": "Microscopic biological cell, nucleus, or cellular structure"
+    },
+    "0253": {
+      "name": "Molecular Structure / DNA (Biochemistry)",
+      "category": "Biochemistry",
+      "description": "DNA double helix or 3D molecular lattice representation"
+    },
+    "0900": {
+      "name": "Unclassified Background / Surface",
+      "category": "Background",
+      "description": "Non-object general background or surface backdrop"
+    },
+    "0901": {
+      "name": "Dark / Shadow Background",
+      "category": "Background",
+      "description": "Deep dark, shadow, or low-luminance background zone"
+    },
+    "0902": {
+      "name": "Bright / Highlight Background",
+      "category": "Background",
+      "description": "High-luminance, specular highlight, or bright background zone"
+    },
+    "0903": {
+      "name": "Gradient / Abstract Texture",
+      "category": "Background",
+      "description": "Continuous color gradient, blur, or abstract graphic texture"
+    },
+    "0904": {
+      "name": "Sky / Upper Backdrop",
+      "category": "Background",
+      "description": "Open sky or atmospheric backdrop in upper canvas"
+    },
+    "0905": {
+      "name": "Ground / Floor / Surface",
+      "category": "Background",
+      "description": "Horizontal ground, asphalt, floor, or platform plane"
+    },
+    "0906": {
+      "name": "Wall / Vertical Surface",
+      "category": "Background",
+      "description": "Vertical architectural wall or indoor partition backdrop"
+    }
+  }
+}
