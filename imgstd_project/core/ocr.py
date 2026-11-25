@@ -5,10 +5,13 @@ Outputs structured TextDescriptors for serialization into the [TXT] layer.
 """
 
 import time
+import logging
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
 import cv2
+
+logger = logging.getLogger("imgstd.ocr")
 
 
 @dataclass
@@ -29,7 +32,8 @@ def get_ocr_engine() -> Any:
         try:
             from rapidocr_onnxruntime import RapidOCR
             _CACHED_OCR_ENGINE = RapidOCR()
-        except Exception:
+        except Exception as exc:
+            logger.warning("RapidOCR failed to initialize (%s); OCR [TXT] layer disabled.", exc)
             _CACHED_OCR_ENGINE = None
     return _CACHED_OCR_ENGINE
 
@@ -100,5 +104,6 @@ class FastSceneOCR:
                     text=clean_text
                 ))
             return results
-        except Exception:
+        except Exception as exc:
+            logger.warning("RapidOCR inference failed on image (%s).", exc)
             return []

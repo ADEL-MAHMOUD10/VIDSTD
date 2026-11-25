@@ -9,9 +9,12 @@ import os
 import gc
 import time
 import hashlib
+import logging
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageOps
+
+logger = logging.getLogger("imgstd.scene_clip")
 
 torch = None
 HAS_TORCH = False
@@ -283,7 +286,8 @@ class MobileCLIPSceneAnalyzer:
                 vis.eval()
                 self._visual = vis
                 return True
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to load MobileCLIP2 variant '%s' (%s); falling back to geometric heuristics.", self.open_clip_name, exc)
             self._visual = None
 
         return False
