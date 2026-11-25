@@ -31,6 +31,9 @@ restored_output.png
 verified_restored.png
 ai_demo_*
 
+# Local Showcase Website (excluded from Git for now)
+docs/
+
 # Environment, OS & IDE Files
 .env
 .DS_Store
