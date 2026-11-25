@@ -1,19 +1,14 @@
 """
-IMGSTD Encoder Module — V03.
-Converts any digital image into a structured, deterministic Semantic-Lossless IMGSTD::V03 stream.
-
-V03 upgrades:
-  - YOLO11n-seg Instance Segmentation + Honest Background Modeling (0900-0999)
-  - Region line format: REG:001|KIND:OBJ|CLS:0003|CONF:0.94|BOX:...|RGB:...|COV:...
-  - uint8 Label Map (H×W) with Base85 Zstandard compression
-  - YCoCg-R color decorrelation + horizontal delta filter on residual
-  - Multi-threaded ZstdCompressor(level=3, threads=-1)
-  - [HDR] fields: VER:V03, PRED:YCOCG_HDELTA, LABELMAP_OFFSET, LABELMAP_LEN
+IMGSTD Encoder Module — V02 through V04 (default IMGSTD::V04).
+Converts any 8-bit digital image into a Semantic-Lossless IMGSTD stream with
+hybrid YOLO11n-seg / YOLO-World extraction, RapidOCR [TXT], perceptual HSV attributes,
+and YCoCg-R horizontal-delta Zstandard lossless residuals.
 """
 
 import time
 import base64
 import zlib
+import logging
 from typing import Union, Optional, Tuple, Dict, Any
 import numpy as np
 import cv2
@@ -25,11 +20,13 @@ from .vlm_captioner import get_vlm_captioner
 from .verifier import IntegrityVerifier
 from .fast_b85 import b85encode
 
+logger = logging.getLogger("imgstd.encoder")
+
 
 class IMGSTDEncoder:
     """
-    Standard Semantic-Lossless Image Encoder (V03 & V02).
-    Encodes image matrices into hierarchical [HDR], [SEM], [RES], and [END] layers.
+    Standard Semantic-Lossless Image Encoder (V02–V04, default V04).
+    Encodes 8-bit uint8 image matrices into hierarchical [HDR], [SEM], [TXT], [RES], and [END] layers.
     """
 
     MAGIC_PREFIX = "IMGSTD::V04"
@@ -59,22 +56,29 @@ class IMGSTDEncoder:
         self._cctx = zstd.ZstdCompressor(level=self.compression_level, threads=-1)
 
     def _prepare_image(self, input_source: Union[str, np.ndarray]) -> np.ndarray:
-        """Loads and normalizes image into a uint8 NumPy array with channels."""
+        """Loads and validates an 8-bit uint8 image matrix without lossy bit-depth truncation."""
         if isinstance(input_source, str):
             img = cv2.imread(input_source, cv2.IMREAD_UNCHANGED)
             if img is None:
                 raise ValueError(f"Could not load image from path: {input_source}")
+            if img.dtype != np.uint8:
+                raise ValueError(
+                    f"Bit-exact lossless IMGSTD only supports 8-bit (uint8) images; "
+                    f"got {img.dtype} from '{input_source}'. Convert to 8-bit before encoding."
+                )
             if len(img.shape) == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
             elif img.shape[2] == 3:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             elif img.shape[2] == 4:
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
-            return img.astype(np.uint8)
+            return img
         elif isinstance(input_source, np.ndarray):
             img = input_source
             if img.dtype != np.uint8:
-                img = np.clip(img, 0, 255).astype(np.uint8)
+                raise ValueError(
+                    f"Bit-exact lossless IMGSTD only supports 8-bit uint8 arrays (got {img.dtype})."
+                )
             if len(img.shape) == 2:
                 img = np.expand_dims(img, axis=-1)
             return img
@@ -161,8 +165,8 @@ class IMGSTDEncoder:
                 for r in regions:
                     if not getattr(r, "attributes", None) and r.region_id in reg_attrs:
                         r.attributes = reg_attrs[r.region_id]
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("VLM/CLIP captioning failed during encode (%s); continuing without generated caption.", exc)
 
         # 9. Format [SEM] block (V03/V04: KIND, CONF, COV fields, no RLE)
         sem_lines = ["[SEM]", f"REGIONS:{len(regions)}"]

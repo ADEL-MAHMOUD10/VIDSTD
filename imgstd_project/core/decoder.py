@@ -1,12 +1,6 @@
 """
-IMGSTD Decoder Module — V01/V02.
-Reconstructs 100% bit-exact original image from an IMGSTD::V01 or IMGSTD::V02 stream.
-
-V02 upgrades:
-  - Detects version from magic prefix
-  - Reconstructs base canvas from LABEL_MAP_Z85 (uint8 label map) + color LUT
-  - Reverse spatial prediction: cumsum axis=1 (mod 256) then reverse YCoCg-R
-  - Falls back to V01 logic for V01 streams
+IMGSTD Decoder Module — V01 through V04.
+Reconstructs 100% bit-exact 8-bit image from an IMGSTD::V01..V04 stream with strict bounds checks.
 """
 
 import os
@@ -21,16 +15,31 @@ from .extractor import RLECodec
 from .verifier import IntegrityVerifier
 from .fast_b85 import b85decode
 
+MAX_WIDTH = 16384
+MAX_HEIGHT = 16384
+MAX_CHANNELS = 4
+MAX_PIXELS = 64_000_000  # 64 MP ceiling (256 MB max RGBA frame)
+MAX_STREAM_BYTES = 512 * 1024 * 1024
+
 
 class IntegrityError(Exception):
     """Raised when cryptographic or pixel integrity verification fails."""
     pass
 
 
+def _validate_dimensions(w: int, h: int, c: int) -> None:
+    if w <= 0 or h <= 0 or w > MAX_WIDTH or h > MAX_HEIGHT:
+        raise ValueError(f"Unsafe or invalid image dimensions: {w}x{h} (max {MAX_WIDTH}x{MAX_HEIGHT}).")
+    if c not in (1, 3, 4):
+        raise ValueError(f"Unsupported channel count: {c} (expected 1, 3, or 4).")
+    if (w * h) > MAX_PIXELS:
+        raise ValueError(f"Image pixel count {w * h} exceeds safety limit ({MAX_PIXELS} pixels).")
+
+
 class IMGSTDDecoder:
     """
-    Semantic-Lossless Image Decoder supporting both V01 and V02 streams.
-    Auto-detects version from magic prefix and dispatches accordingly.
+    Semantic-Lossless Image Decoder supporting V01 through V04 streams.
+    Enforces strict decompression size ceilings and array index validation.
     """
 
     def __init__(self):
@@ -38,9 +47,13 @@ class IMGSTDDecoder:
 
     def _read_stream(self, input_source: str) -> str:
         """Reads stream from string or file path safely."""
+        if not isinstance(input_source, str) or "\x00" in input_source:
+            raise ValueError("Invalid IMGSTD input source.")
         if input_source.startswith("IMGSTD::"):
             return input_source
-        if len(input_source) < 4096 and os.path.exists(input_source):
+        if len(input_source) < 4096 and os.path.isfile(input_source):
+            if os.path.getsize(input_source) > MAX_STREAM_BYTES:
+                raise ValueError(f"Stream file exceeds maximum allowed size ({MAX_STREAM_BYTES} bytes).")
             with open(input_source, "r", encoding="utf-8") as f:
                 return f.read()
         return input_source
@@ -99,6 +112,7 @@ class IMGSTDDecoder:
         w = int(hdr_map["W"])
         h = int(hdr_map["H"])
         c = int(hdr_map["C"])
+        _validate_dimensions(w, h, c)
         expected_sha = hdr_map["SHA256"]
 
         # 2. Extract [SEM] block
@@ -122,27 +136,37 @@ class IMGSTDDecoder:
                     if ":" in p:
                         fk, fv = p.split(":", 1)
                         fd[fk] = fv
-                label_id = int(fd["REG"])  # region_id == label_id (1-indexed)
+                label_id = int(fd["REG"])
+                if not (0 <= label_id <= 255):
+                    raise ValueError(f"Out-of-range label_id in [SEM]: {label_id}")
                 rgb = [int(v) for v in fd["RGB"].split(",")]
+                if len(rgb) < c or any(not (0 <= v <= 255) for v in rgb[:c]):
+                    raise ValueError(f"Invalid RGB channel values in REG:{label_id}")
                 color_lut[label_id] = rgb[:c]
 
         if label_map_b85 is None:
-            raise ValueError("Malformed V02 stream: missing LABEL_MAP_Z85 in [SEM].")
+            raise ValueError("Malformed V02+ stream: missing LABEL_MAP_Z85 in [SEM].")
 
-        # Decompress label map
-        label_map_bytes = self._dctx.decompress(b85decode(label_map_b85))
+        # Decompress label map with exact bounded output ceiling
+        expected_label_bytes = h * w
+        label_map_bytes = self._dctx.decompress(b85decode(label_map_b85), max_output_size=expected_label_bytes)
+        if len(label_map_bytes) != expected_label_bytes:
+            raise ValueError(f"Corrupted LABEL_MAP payload: expected {expected_label_bytes} bytes, got {len(label_map_bytes)}.")
         label_map = np.frombuffer(label_map_bytes, dtype=np.uint8).reshape(h, w)
 
         # Build base canvas via LUT
         base_canvas = color_lut[label_map]  # (H, W, c)
         t_base_ms = (time.perf_counter() - t_base_start) * 1000.0
 
-        # 4. Extract and decompress [RES]
+        # 4. Extract and decompress [RES] with exact bounded output ceiling
         t_res_start = time.perf_counter()
         res_block = self._extract_block(stream, hdr_map, "RES", "[RES]", "[/RES]")
         res_content = res_block.replace("[RES]", "").replace("[/RES]", "").strip()
         compressed_bytes = b85decode(res_content)
-        delta_raw = self._dctx.decompress(compressed_bytes)
+        expected_res_bytes = h * w * c
+        delta_raw = self._dctx.decompress(compressed_bytes, max_output_size=expected_res_bytes)
+        if len(delta_raw) != expected_res_bytes:
+            raise ValueError(f"Corrupted [RES] payload: expected {expected_res_bytes} bytes, got {len(delta_raw)}.")
         delta = np.frombuffer(delta_raw, dtype=np.uint8).reshape(h, w, c)
         t_res_ms = (time.perf_counter() - t_res_start) * 1000.0
 
@@ -209,6 +233,7 @@ class IMGSTDDecoder:
         w = int(hdr_map["W"])
         h = int(hdr_map["H"])
         c = int(hdr_map["C"])
+        _validate_dimensions(w, h, c)
         expected_sha = hdr_map["SHA256"]
 
         sem_block = self._extract_block(stream, hdr_map, "SEM", "[SEM]", "[/SEM]")
@@ -231,18 +256,25 @@ class IMGSTDDecoder:
                     fk, fv = p.split(":", 1)
                     fd[fk] = fv
             bx, by, bw, bh = [int(v) for v in fd["BOX"].split(",")]
+            if bx < 0 or by < 0 or bw <= 0 or bh <= 0 or (bx + bw) > w or (by + bh) > h:
+                raise ValueError(f"Out-of-bounds V01 region box: {(bx, by, bw, bh)} for {w}x{h}")
             rgb = [int(v) for v in fd["RGB"].split(",")]
+            if len(rgb) < c or any(not (0 <= v <= 255) for v in rgb[:c]):
+                raise ValueError(f"Invalid V01 RGB values: {rgb}")
             rle_str = fd.get("RLE", "")
             mask = RLECodec.decode(rle_str, (bh, bw))
             base_canvas[by:by + bh, bx:bx + bw][mask] = rgb[:c]
 
         t_base_ms = (time.perf_counter() - t_base_start) * 1000.0
 
-        # Decompress residual
+        # Decompress residual with strict output bound
         t_res_start = time.perf_counter()
         res_content = res_block.replace("[RES]", "").replace("[/RES]", "").strip()
         compressed_bytes = base64.b85decode(res_content.encode("ascii"))
-        residual_raw = self._dctx.decompress(compressed_bytes)
+        expected_res_bytes = h * w * c
+        residual_raw = self._dctx.decompress(compressed_bytes, max_output_size=expected_res_bytes)
+        if len(residual_raw) != expected_res_bytes:
+            raise ValueError(f"Corrupted V01 [RES] payload: expected {expected_res_bytes} bytes, got {len(residual_raw)}.")
         residual = np.frombuffer(residual_raw, dtype=np.uint8).reshape((h, w, c))
         t_res_ms = (time.perf_counter() - t_res_start) * 1000.0
 

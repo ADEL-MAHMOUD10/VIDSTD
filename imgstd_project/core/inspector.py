@@ -1,7 +1,6 @@
 """
-IMGSTD Inspector Module — V01/V02.
-Ultra-fast O(1) parser for [HDR] and [SEM] layers enabling zero-vision AI image comprehension.
-Supports both IMGSTD::V01 (RLE format) and IMGSTD::V02 (COV format, no RLE).
+IMGSTD Inspector Module — V01 through V04.
+Ultra-fast O(1) parser for [HDR], [SEM], and [TXT] layers enabling zero-vision AI image comprehension.
 """
 
 import os
@@ -10,12 +9,14 @@ import time
 from typing import Dict, Any, Optional, List
 import numpy as np
 
+MAX_INSPECT_SEM_BYTES = 16 * 1024 * 1024
+MAX_INSPECT_TXT_BYTES = 4 * 1024 * 1024
+
 
 class IMGSTDInspector:
     """
-    Standard Semantic-Lossless Image Inspector (V01/V02).
-    Parses ONLY [HDR] and [SEM] blocks in <2ms without loading or decompressing the residual stream.
-    Reports protocol version correctly for both V01 and V02 streams.
+    Standard Semantic-Lossless Image Inspector (V01–V04).
+    Parses ONLY [HDR], [SEM], and [TXT] blocks in O(1) without loading or decompressing [RES].
     """
 
     _VOCABULARY_CACHE: Optional[Dict[str, Any]] = None
@@ -57,6 +58,7 @@ class IMGSTDInspector:
         is_file_path = (not input_source.startswith("IMGSTD::")) and len(input_source) < 4096 and os.path.exists(input_source)
 
         if is_file_path:
+            file_size = os.path.getsize(input_source)
             with open(input_source, "rb") as f:
                 head_str = f.read(4096).decode("utf-8", errors="replace")
                 if not head_str.startswith("IMGSTD::"):
@@ -74,16 +76,24 @@ class IMGSTDInspector:
                         hdr_map[k.strip()] = v.strip()
 
                 if "SEM_OFFSET" in hdr_map and "SEM_LEN" in hdr_map:
-                    f.seek(int(hdr_map["SEM_OFFSET"]))
-                    cand = f.read(int(hdr_map["SEM_LEN"])).decode("utf-8", errors="replace")
-                    if cand.startswith("[SEM]"):
-                        sem_block = cand
-                if "TXT_OFFSET" in hdr_map and "TXT_LEN" in hdr_map and int(hdr_map["TXT_LEN"]) > 0:
-                    f.seek(int(hdr_map["TXT_OFFSET"]))
-                    cand = f.read(int(hdr_map["TXT_LEN"])).decode("utf-8", errors="replace")
-                    if cand.startswith("[TXT]"):
-                        txt_block = cand
+                    sem_off = int(hdr_map["SEM_OFFSET"])
+                    sem_len = int(hdr_map["SEM_LEN"])
+                    if 0 <= sem_off and 0 < sem_len <= MAX_INSPECT_SEM_BYTES and (sem_off + sem_len) <= file_size:
+                        f.seek(sem_off)
+                        cand = f.read(sem_len).decode("utf-8", errors="replace")
+                        if cand.startswith("[SEM]"):
+                            sem_block = cand
+                if "TXT_OFFSET" in hdr_map and "TXT_LEN" in hdr_map:
+                    txt_off = int(hdr_map["TXT_OFFSET"])
+                    txt_len = int(hdr_map["TXT_LEN"])
+                    if 0 <= txt_off and 0 < txt_len <= MAX_INSPECT_TXT_BYTES and (txt_off + txt_len) <= file_size:
+                        f.seek(txt_off)
+                        cand = f.read(txt_len).decode("utf-8", errors="replace")
+                        if cand.startswith("[TXT]"):
+                            txt_block = cand
                 if not sem_block:
+                    if file_size > MAX_INSPECT_SEM_BYTES * 2:
+                        raise ValueError("Malformed stream: missing valid indexed [SEM] block in large file.")
                     f.seek(0)
                     stream = f.read().decode("utf-8", errors="replace")
         else:

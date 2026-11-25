@@ -9,14 +9,17 @@ import sys
 import time
 import shutil
 import hashlib
+import logging
 from typing import List, Dict, Any, Tuple, Optional, Union
 import numpy as np
 import cv2
 import zstandard as zstd
 
 from .encoder import encode_image, IMGSTDEncoder
-from .decoder import decode_imgstd
+from .decoder import decode_imgstd, _validate_dimensions
 from .inspector import inspect_imgstd
+
+logger = logging.getLogger("imgstd.video")
 from .verifier import IntegrityVerifier
 from .fast_b85 import b85encode, b85decode
 from .video_tracker import SceneCutDetector, TemporalObjectTracker
@@ -161,8 +164,8 @@ class VideoEncoder:
                     clip_caption = vlm.caption_video_clip(scene_burst_frames, fps=fps)
                     if clip_caption and "Empty video sequence" not in clip_caption:
                         tracker.scenes[-1].context = clip_caption
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("SmolVLM2 clip captioning failed (%s); keeping MobileCLIP2/heuristic context.", exc)
 
         def _record_scene_burst_frame(frm: np.ndarray):
             if not self.enable_smolvlm2:
@@ -459,13 +462,13 @@ class VideoEncoder:
             if tmp_gop_file is not None:
                 try:
                     tmp_gop_file.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("SmolVLM2 clip captioning failed (%s); keeping MobileCLIP2/heuristic context.", exc)
             if tmp_gop_path and os.path.exists(tmp_gop_path):
                 try:
                     os.remove(tmp_gop_path)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("SmolVLM2 clip captioning failed (%s); keeping MobileCLIP2/heuristic context.", exc)
 
         t_elapsed = (time.perf_counter() - t_start) * 1000.0
 
@@ -590,6 +593,8 @@ class VideoDecoder:
             gop_block_str = stream_bytes[off:off + ln].decode("utf-8")
 
         w, h, c = hdr["W"], hdr["H"], hdr["C"]
+        _validate_dimensions(w, h, c)
+        expected_delta_bytes = h * w * c
 
         # Parse GOP block frames
         lines = [line.strip() for line in gop_block_str.split("\n") if line.strip().startswith("F:")]
@@ -610,11 +615,17 @@ class VideoDecoder:
 
             elif f_type == "S":
                 # Duplicate of previous frame
+                if current_frame is None:
+                    raise ValueError("Malformed GOP: S-frame precedes keyframe I.")
                 current_frame = current_frame.copy()
 
             elif f_type == "P":
+                if current_frame is None:
+                    raise ValueError("Malformed GOP: P-frame precedes keyframe I.")
                 delta_b85 = f_map["RES_DELTA_Z85"]
-                delta_raw = self._dctx.decompress(b85decode(delta_b85))
+                delta_raw = self._dctx.decompress(b85decode(delta_b85), max_output_size=expected_delta_bytes)
+                if len(delta_raw) != expected_delta_bytes:
+                    raise ValueError(f"Corrupted P-frame delta payload on frame {idx}: expected {expected_delta_bytes} bytes, got {len(delta_raw)}.")
                 pred = np.frombuffer(delta_raw, dtype=np.uint8).reshape(h, w, c)
 
                 if c == 3:
@@ -694,6 +705,8 @@ class VideoDecoder:
                 aud_str = self._extract_block(stream, hdr, "AUD") if hdr.get("AUD_LEN", 0) > 0 else ""
 
             w, h, c = hdr["W"], hdr["H"], hdr["C"]
+            _validate_dimensions(w, h, c)
+            expected_delta_bytes = h * w * c
             fps = hdr["FPS"]
             total_frames = hdr["TOTAL_FRAMES"]
             if hdr.get("MODE") == "SEMANTIC_REF":
@@ -754,11 +767,17 @@ class VideoDecoder:
                             current_frame, _ = decode_imgstd(v04_code, verify_sha=True)
 
                         elif f_type == "S":
+                            if current_frame is None:
+                                raise ValueError("Malformed GOP: S-frame precedes keyframe I.")
                             current_frame = current_frame.copy()
 
                         elif f_type == "P":
+                            if current_frame is None:
+                                raise ValueError("Malformed GOP: P-frame precedes keyframe I.")
                             delta_b85 = f_map["RES_DELTA_Z85"]
-                            delta_raw = self._dctx.decompress(b85decode(delta_b85))
+                            delta_raw = self._dctx.decompress(b85decode(delta_b85), max_output_size=expected_delta_bytes)
+                            if len(delta_raw) != expected_delta_bytes:
+                                raise ValueError(f"Corrupted P-frame delta payload on frame {idx}.")
                             pred = np.frombuffer(delta_raw, dtype=np.uint8).reshape(h, w, c)
 
                             if c == 3:
