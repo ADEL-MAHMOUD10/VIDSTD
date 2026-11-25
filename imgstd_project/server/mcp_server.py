@@ -1,17 +1,15 @@
 """
-IMGSTD Reference Model Context Protocol (MCP) Server.
-Exposes standard resources and tools for Zero-Vision AI image comprehension and bit-exact decoding.
+IMGSTD & VIDSTD Reference Model Context Protocol (MCP) Server.
+Exposes sandboxed resources and tools for Zero-Vision AI comprehension and bit-exact decoding.
 """
 
 import os
-import sys
-
-# Ensure root workspace directory is on sys.path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-
 import json
+import logging
 from typing import Optional, Dict, Any
 import numpy as np
+
+logger = logging.getLogger("imgstd.mcp")
 
 try:
     from mcp.server.mcpserver import MCPServer
@@ -19,7 +17,7 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP as MCPServer
 
 from imgstd_project.core.inspector import inspect_imgstd
-from imgstd_project.core.decoder import decode_imgstd
+from imgstd_project.core.decoder import decode_imgstd, MAX_PIXELS, MAX_WIDTH, MAX_HEIGHT
 from imgstd_project.core.encoder import encode_image
 from imgstd_project.core.video_codec import (
     encode_video_to_vidstd,
@@ -39,6 +37,47 @@ mcp = MCPServer(
 SPEC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "spec"))
 VOCAB_PATH = os.path.join(SPEC_DIR, "vocabulary.json")
 SPEC_PATH = os.path.join(SPEC_DIR, "protocol_spec.md")
+
+
+def get_sandbox_root() -> str:
+    """Returns canonical filesystem sandbox root (IMGSTD_SANDBOX_ROOT or current working directory)."""
+    root = os.environ.get("IMGSTD_SANDBOX_ROOT") or os.getcwd()
+    return os.path.realpath(root)
+
+
+def resolve_sandbox_path(raw_path: str, must_exist: bool = False) -> str:
+    """
+    Validates that raw_path resolves strictly inside get_sandbox_root().
+    Blocks path traversal ('..'), out-of-sandbox absolute paths, and symlink escapes.
+    """
+    if not raw_path or not isinstance(raw_path, str):
+        raise ValueError("Path must be a non-empty string.")
+    if "\x00" in raw_path:
+        raise ValueError("Invalid null byte in path.")
+
+    sandbox = get_sandbox_root()
+    candidate = raw_path if os.path.isabs(raw_path) else os.path.join(sandbox, raw_path)
+    resolved = os.path.realpath(candidate)
+
+    try:
+        common = os.path.commonpath([sandbox, resolved])
+    except ValueError as exc:
+        raise PermissionError(f"Access denied: path '{raw_path}' is outside sandbox '{sandbox}'.") from exc
+
+    if common != sandbox:
+        raise PermissionError(f"Access denied: path '{raw_path}' resolves outside sandbox '{sandbox}'.")
+
+    if must_exist and not os.path.isfile(resolved):
+        raise FileNotFoundError(f"File not found inside sandbox: {raw_path}")
+
+    return resolved
+
+
+def _resolve_vidstd_source(vidstd_source: str) -> str:
+    """Resolves a VIDSTD stream string or sandboxed .vidstd file path safely."""
+    if isinstance(vidstd_source, str) and vidstd_source.startswith("VIDSTD::"):
+        return vidstd_source
+    return resolve_sandbox_path(vidstd_source, must_exist=True)
 
 
 @mcp.resource("imgstd://spec/v01")
@@ -70,29 +109,28 @@ def get_protocol_specification() -> str:
 def inspect_imgstd_code(imgstd_code: str) -> Dict[str, Any]:
     """
     Ultra-fast O(1) Zero-Vision AI inspection tool.
-    Parses ONLY the header [HDR] and semantic [SEM] layers in <2ms without Computer Vision,
-    returning dimensions, SHA-256 seal, and all detected objects with their human-readable labels,
-    bounding boxes, dominant RGB colors, and canvas coverage percentages.
-    
+    Parses ONLY [HDR], [SEM], and [TXT] layers without Computer Vision or pixel decompression.
+
     Args:
-        imgstd_code: The raw IMGSTD string or a local file path to an .imgstd file.
+        imgstd_code: Raw IMGSTD:: stream string or sandbox-relative/contained .imgstd file path.
     """
-    return inspect_imgstd(imgstd_code)
+    source = imgstd_code if imgstd_code.startswith("IMGSTD::") else resolve_sandbox_path(imgstd_code, must_exist=True)
+    return inspect_imgstd(source)
 
 
 @mcp.tool()
 def decode_imgstd_to_image(imgstd_code: str, output_image_path: str, verify_sha: bool = True) -> Dict[str, Any]:
     """
-    Restores an exact original image from an IMGSTD stream.
-    Rebuilds the Base Canvas from [SEM], decompresses [RES], adds (B + R) mod 256,
-    saves the image (PNG/BMP) to output_image_path, and verifies SHA-256 equality.
+    Restores an exact 8-bit original image from an IMGSTD stream inside the sandbox.
 
     Args:
-        imgstd_code: The raw IMGSTD string or a local file path to an .imgstd file.
-        output_image_path: Target path to write the restored image (e.g. 'restored.png').
+        imgstd_code: Raw IMGSTD:: stream string or sandbox-contained .imgstd file path.
+        output_image_path: Target path inside sandbox to write the restored image (e.g. 'restored.png').
         verify_sha: Set to False if decoding intentionally recolored/edited streams.
     """
-    _, metrics = decode_imgstd(imgstd_code, output_image_path=output_image_path, verify_sha=verify_sha)
+    source = imgstd_code if imgstd_code.startswith("IMGSTD::") else resolve_sandbox_path(imgstd_code, must_exist=True)
+    safe_out = resolve_sandbox_path(output_image_path, must_exist=False)
+    _, metrics = decode_imgstd(source, output_image_path=safe_out, verify_sha=verify_sha)
     return metrics
 
 
@@ -104,29 +142,30 @@ def encode_image_to_imgstd(
     enable_smolvlm2: Optional[bool] = None
 ) -> Dict[str, Any]:
     """
-    Encodes any digital image into a standardized Semantic-Lossless IMGSTD stream in milliseconds.
-    Extracts semantic regions into [SEM] and compresses exact mathematical residual into [RES].
+    Encodes a sandbox-contained 8-bit image into a Semantic-Lossless IMGSTD::V04 stream.
 
     Args:
-        input_image_path: Path to the source image (PNG, JPG, BMP, etc.).
-        output_code_path: Optional path to save the resulting .imgstd text stream.
+        input_image_path: Sandbox path to source 8-bit image (PNG, JPG, BMP, etc.).
+        output_code_path: Optional sandbox path to save the .imgstd file (default: <name>.imgstd).
         scene_model: Optional MobileCLIP2 model override (e.g. "mobileclip2-s0", "mobileclip2-s2", "mobileclip2-l-14").
         enable_smolvlm2: Optional override to run SmolVLM2 generative VLM captioning (true/false).
     """
+    safe_in = resolve_sandbox_path(input_image_path, must_exist=True)
     if not output_code_path:
-        base = os.path.splitext(os.path.basename(input_image_path))[0]
+        base = os.path.splitext(os.path.basename(safe_in))[0]
         output_code_path = f"{base}.imgstd"
+    safe_out = resolve_sandbox_path(output_code_path, must_exist=False)
 
     code, metrics = encode_image(
-        input_image_path,
-        output_path=output_code_path,
+        safe_in,
+        output_path=safe_out,
         scene_model=scene_model,
         enable_smolvlm2=enable_smolvlm2,
     )
     return {
         "metrics": metrics,
-        "output_path": output_code_path,
-        "imgstd_code": code if len(code) < 32768 else output_code_path
+        "output_path": safe_out,
+        "imgstd_code": code if len(code) < 32768 else safe_out
     }
 
 
@@ -217,11 +256,14 @@ def update_settings(
 
 
 def _load_stream_or_path(imgstd_code: str) -> str:
-    """Safely loads a stream string or reads a UTF-8 file path without overflowing Windows path limits."""
-    if not imgstd_code.startswith("IMGSTD::") and len(imgstd_code) < 4096 and os.path.exists(imgstd_code):
-        with open(imgstd_code, "r", encoding="utf-8") as f:
-            return f.read()
-    return imgstd_code
+    """Safely loads a raw IMGSTD stream or reads a strictly sandbox-contained UTF-8 file."""
+    if not isinstance(imgstd_code, str) or not imgstd_code:
+        raise ValueError("imgstd_code must be a non-empty stream or sandbox file path.")
+    if imgstd_code.startswith("IMGSTD::"):
+        return imgstd_code
+    safe_path = resolve_sandbox_path(imgstd_code, must_exist=True)
+    with open(safe_path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 def _recompute_imgstd_headers_and_crc(code: str) -> str:
@@ -357,10 +399,15 @@ def query_region_at_point(imgstd_code: str, x: int, y: int) -> dict:
 
         if label_map_line:
             import zstandard as zstd
-            H = inspection['dimensions']['height']
-            W = inspection['dimensions']['width']
+            H = int(inspection['dimensions']['height'])
+            W = int(inspection['dimensions']['width'])
+            if H <= 0 or W <= 0 or H > MAX_HEIGHT or W > MAX_WIDTH or (H * W) > MAX_PIXELS:
+                raise ValueError(f"Unsafe or invalid image dimensions: {W}x{H}")
             compressed = base64.b85decode(label_map_line.encode('ascii'))
-            label_raw = zstd.ZstdDecompressor().decompress(compressed)
+            expected_len = H * W
+            label_raw = zstd.ZstdDecompressor().decompress(compressed, max_output_size=expected_len)
+            if len(label_raw) != expected_len:
+                raise ValueError("Corrupted LABEL_MAP payload length.")
             label_map = np.frombuffer(label_raw, dtype=np.uint8).reshape(H, W)
 
             if 0 <= y < H and 0 <= x < W:
@@ -440,13 +487,15 @@ def encode_video_to_vidstd_tool(
         scene_model: Optional MobileCLIP2 model override (e.g. "mobileclip2-s0", "mobileclip2-s2", "mobileclip2-l-14").
         enable_smolvlm2: Optional override to run SmolVLM2 generative VLM (true/false).
     """
+    safe_in = resolve_sandbox_path(video_path, must_exist=True)
     if not output_vidstd_path:
-        base = os.path.splitext(os.path.basename(video_path))[0]
+        base = os.path.splitext(os.path.basename(safe_in))[0]
         output_vidstd_path = f"{base}.vidstd"
+    safe_out = resolve_sandbox_path(output_vidstd_path, must_exist=False)
 
     _, metrics = encode_video_to_vidstd(
-        video_path,
-        output_path=output_vidstd_path,
+        safe_in,
+        output_path=safe_out,
         gop_size=gop_size,
         max_frames=max_frames,
         semantic_only=semantic_only,
@@ -454,7 +503,7 @@ def encode_video_to_vidstd_tool(
         scene_model=scene_model,
         enable_smolvlm2=enable_smolvlm2,
     )
-    metrics["output_path"] = output_vidstd_path
+    metrics["output_path"] = safe_out
     return metrics
 
 
@@ -466,9 +515,9 @@ def inspect_vidstd_timeline(vidstd_path: str) -> Dict[str, Any]:
     returning structured scenes, object trajectories, text events, and duration.
 
     Args:
-        vidstd_path: Path to .vidstd file.
+        vidstd_path: Sandbox-contained path to .vidstd file.
     """
-    return inspect_vidstd(vidstd_path)
+    return inspect_vidstd(_resolve_vidstd_source(vidstd_path))
 
 
 @mcp.tool()
@@ -478,10 +527,10 @@ def query_vidstd_at_timestamp(vidstd_path: str, timestamp_sec: float) -> Dict[st
     visible texts, and current scene at second T in the video.
 
     Args:
-        vidstd_path: Path to .vidstd file.
+        vidstd_path: Sandbox-contained path to .vidstd file.
         timestamp_sec: Video timestamp in seconds (e.g. 5.5).
     """
-    inspection = inspect_vidstd(vidstd_path)
+    inspection = inspect_vidstd(_resolve_vidstd_source(vidstd_path))
     fps = inspection["video_metadata"]["fps"]
     target_frame = int(round(timestamp_sec * fps))
 
@@ -550,9 +599,11 @@ def extract_lossless_video_frame(vidstd_path: str, frame_index: int, output_imag
         frame_index: 0-indexed integer frame number to extract.
         output_image_path: Optional path to save extracted frame (e.g. 'frame_45.png').
     """
-    _, metrics = extract_vidstd_frame(vidstd_path, frame_index, output_image_path=output_image_path)
-    if output_image_path:
-        metrics["output_path"] = output_image_path
+    safe_vid = _resolve_vidstd_source(vidstd_path)
+    safe_out = resolve_sandbox_path(output_image_path, must_exist=False) if output_image_path else None
+    _, metrics = extract_vidstd_frame(safe_vid, frame_index, output_image_path=safe_out)
+    if safe_out:
+        metrics["output_path"] = safe_out
     return metrics
 
 
@@ -564,9 +615,9 @@ def get_vidstd_overview_tool(vidstd_path: str) -> Dict[str, Any]:
     Ideal for Zero-Vision LLM orientation before diving into specific scenes.
 
     Args:
-        vidstd_path: Path to .vidstd file.
+        vidstd_path: Sandbox-contained path to .vidstd file.
     """
-    return get_vidstd_overview(vidstd_path)
+    return get_vidstd_overview(_resolve_vidstd_source(vidstd_path))
 
 
 @mcp.tool()
@@ -582,14 +633,14 @@ def search_vidstd_timeline_tool(
     with optional keyword, class name, and time-range filtering.
 
     Args:
-        vidstd_path: Path to .vidstd file.
+        vidstd_path: Sandbox-contained path to .vidstd file.
         query: Substring to match in object class, motion, or text events.
         class_filter: Filter for specific class (e.g. '0201', 'Planet Earth', 'Car').
         start_sec: Optional start time in seconds.
         end_sec: Optional end time in seconds.
     """
     return search_vidstd_timeline(
-        vidstd_path,
+        _resolve_vidstd_source(vidstd_path),
         query=query,
         class_filter=class_filter,
         start_sec=start_sec,
@@ -609,11 +660,11 @@ def inspect_vidstd_timeframe_tool(
     for instant O(1) single-frame extraction.
 
     Args:
-        vidstd_path: Path to .vidstd file.
+        vidstd_path: Sandbox-contained path to .vidstd file.
         start_sec: Start time in seconds.
         end_sec: End time in seconds.
     """
-    return inspect_vidstd_timeframe(vidstd_path, start_sec=start_sec, end_sec=end_sec)
+    return inspect_vidstd_timeframe(_resolve_vidstd_source(vidstd_path), start_sec=start_sec, end_sec=end_sec)
 
 
 def main():

@@ -115,6 +115,7 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
 SMOLVLM2_INFO: Dict[str, Any] = {
     "id": "smolvlm2",
     "model_id": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+    "revision": "main",
     "kind": "generative_vlm",
     "tier": "GENERATIVE VLM / HEAVY",
     "tier_label": "نموذج رؤية ولغة توليدي ثقيل (اختياري)",
@@ -257,6 +258,7 @@ def download_model_weights(model_id: str, quiet: bool = False) -> Dict[str, Any]
             print(f"[*] Downloading SmolVLM2 ({SMOLVLM2_INFO['model_id']}) to {target_dir}...")
         snapshot_download(
             repo_id=SMOLVLM2_INFO["model_id"],
+            revision=SMOLVLM2_INFO.get("revision", "main"),
             local_dir=target_dir,
             ignore_patterns=["*.onnx", "onnx/*", "*.bin"],
         )

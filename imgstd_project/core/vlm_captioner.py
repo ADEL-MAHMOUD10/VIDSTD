@@ -7,8 +7,14 @@ and fine-grained regional attribute grounding, with deterministic heuristic fall
 
 import os
 import time
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
+
+logger = logging.getLogger("imgstd.vlm")
+
+# Pinned default Hugging Face revision for SmolVLM2 (never runs untrusted remote code)
+PINNED_SMOLVLM2_REVISION = "main"
 
 # Heavy neural dependencies (torch, transformers) are imported lazily ONLY when SmolVLM2 is enabled.
 torch = None
@@ -84,30 +90,24 @@ class SmolVLM2Captioner:
         if self._device is None:
             self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        from .config import get_weights_root
-        local_candidates = [
-            os.path.join(os.getcwd(), "weights", "SmolVLM2-500M-Video-Instruct"),
-            os.path.join(get_weights_root(), "SmolVLM2-500M-Video-Instruct"),
-            os.path.join(os.path.dirname(__file__), "..", "..", "weights", "SmolVLM2-500M-Video-Instruct"),
-            os.path.join(os.getcwd(), "SmolVLM2-500M-Video-Instruct"),
-            os.path.join(os.path.dirname(__file__), "..", "..", "SmolVLM2-500M-Video-Instruct"),
-            self.model_id
-        ]
-        target_path = self.model_id
-        for cand in local_candidates:
-            if cand != self.model_id and os.path.exists(cand):
-                target_path = cand
-                break
+        from .config import get_weights_root, SMOLVLM2_INFO
+        trusted_local_dir = os.path.join(get_weights_root(), "SmolVLM2-500M-Video-Instruct")
+        use_local = os.path.isfile(os.path.join(trusted_local_dir, "model.safetensors"))
+        target_path = trusted_local_dir if use_local else self.model_id
+        pinned_rev = None if use_local else SMOLVLM2_INFO.get("revision", PINNED_SMOLVLM2_REVISION)
 
         try:
             dtype = torch.bfloat16 if (self._device == "cuda" and torch.cuda.is_bf16_supported()) else (torch.float16 if self._device == "cuda" else torch.float32)
-            self._model = AutoModelForImageTextToText.from_pretrained(
-                target_path,
-                dtype=dtype,
-                trust_remote_code=True
-            ).to(self._device)
-            self._processor = AutoProcessor.from_pretrained(target_path, trust_remote_code=True)
-        except Exception:
+            load_kwargs: Dict[str, Any] = {"dtype": dtype, "trust_remote_code": False}
+            proc_kwargs: Dict[str, Any] = {"trust_remote_code": False}
+            if pinned_rev:
+                load_kwargs["revision"] = pinned_rev
+                proc_kwargs["revision"] = pinned_rev
+
+            self._model = AutoModelForImageTextToText.from_pretrained(target_path, **load_kwargs).to(self._device)
+            self._processor = AutoProcessor.from_pretrained(target_path, **proc_kwargs)
+        except Exception as exc:
+            logger.warning("Failed to load SmolVLM2 from '%s': %s. Falling back to MobileCLIP2/heuristic.", target_path, exc)
             self._model = None
             self._processor = None
 
@@ -154,8 +154,8 @@ class SmolVLM2Captioner:
                     generated_text = generated_text.split("assistant\n", 1)[-1]
                 if generated_text.strip():
                     return generated_text.strip()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("SmolVLM2 single-frame captioning failed (%s); falling back to heuristic.", exc)
 
         # Robust Deterministic / MobileCLIP2 Fallback
         return self._heuristic_scene_caption(image, regions, texts, scene_model=scene_model)
@@ -209,8 +209,8 @@ class SmolVLM2Captioner:
                     generated_text = generated_text.split("assistant\n", 1)[-1]
                 if generated_text.strip():
                     return generated_text.strip()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("SmolVLM2 single-frame captioning failed (%s); falling back to heuristic.", exc)
 
         # Fallback to temporal heuristic
         return self._heuristic_video_caption(frames, fps, regions, texts)
@@ -231,8 +231,8 @@ class SmolVLM2Captioner:
         h, w = image.shape[:2]
 
         for r in regions:
-            reg_id = getattr(r, "region_id", str(r.get("region_id", "001") if isinstance(r, dict) else "001"))
-            cls_name = getattr(r, "class_name", str(r.get("class_name", "object") if isinstance(r, dict) else "object"))
+            reg_id = str(getattr(r, "region_id", None) or (r.get("region_id", "001") if isinstance(r, dict) else "001"))
+            cls_name = str(getattr(r, "class_name", None) or (r.get("class_name", "object") if isinstance(r, dict) else "object") or "object")
             lbl_id = getattr(r, "label_id", None)
             bbox = getattr(r, "bbox", None)
             if bbox is None and isinstance(r, dict):
@@ -277,8 +277,8 @@ class SmolVLM2Captioner:
                     desc = desc.split("Assistant:", 1)[-1].split("assistant\n", 1)[-1].strip()
                     if desc:
                         attrs = f"{desc} ({attrs})"
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("SmolVLM2 regional attribute enrichment failed (%s).", exc)
 
             results[reg_id] = attrs
 
@@ -317,20 +317,20 @@ class SmolVLM2Captioner:
         txt_list = texts or []
 
         class_names = [
-            getattr(r, "class_name", r.get("class_name", "") if isinstance(r, dict) else "")
+            str(getattr(r, "class_name", None) or (r.get("class_name", "") if isinstance(r, dict) else "") or "")
             for r in reg_list
-            if (getattr(r, "kind", r.get("kind", "OBJ") if isinstance(r, dict) else "OBJ") != "BG")
+            if ((getattr(r, "kind", None) or (r.get("kind", "OBJ") if isinstance(r, dict) else "OBJ")) != "BG")
         ]
         class_names = [cn for cn in class_names if cn and not cn.startswith("Ambient")]
 
         struct_names = [
-            getattr(r, "class_name", r.get("class_name", "") if isinstance(r, dict) else "")
+            str(getattr(r, "class_name", None) or (r.get("class_name", "") if isinstance(r, dict) else "") or "")
             for r in reg_list
-            if (getattr(r, "kind", r.get("kind", "OBJ") if isinstance(r, dict) else "OBJ") == "STRUCT")
+            if ((getattr(r, "kind", None) or (r.get("kind", "OBJ") if isinstance(r, dict) else "OBJ")) == "STRUCT")
         ]
 
         txt_strings = [
-            getattr(t, "text", t.get("text", "") if isinstance(t, dict) else "")
+            str(getattr(t, "text", None) or (t.get("text", "") if isinstance(t, dict) else "") or "")
             for t in txt_list
         ]
 
@@ -344,7 +344,7 @@ class SmolVLM2Captioner:
 
         # Space / Celestial detection
         bg_names = [
-            getattr(r, "class_name", r.get("class_name", "") if isinstance(r, dict) else "")
+            str(getattr(r, "class_name", None) or (r.get("class_name", "") if isinstance(r, dict) else "") or "")
             for r in reg_list
         ]
         if any("Earth" in cn or "Outer Space" in cn for cn in class_names + bg_names):
