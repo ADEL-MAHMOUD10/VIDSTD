@@ -116,7 +116,8 @@ class SmolVLM2Captioner:
         image: np.ndarray,
         regions: Optional[List[Any]] = None,
         texts: Optional[List[Any]] = None,
-        scene_model: Optional[str] = None
+        scene_model: Optional[str] = None,
+        precomputed_clip: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Executes single image multimodal description or heuristic fallback.
@@ -158,7 +159,9 @@ class SmolVLM2Captioner:
                 logger.warning("SmolVLM2 single-frame captioning failed (%s); falling back to heuristic.", exc)
 
         # Robust Deterministic / MobileCLIP2 Fallback
-        return self._heuristic_scene_caption(image, regions, texts, scene_model=scene_model)
+        return self._heuristic_scene_caption(
+            image, regions, texts, scene_model=scene_model, precomputed_clip=precomputed_clip
+        )
 
     def caption_video_clip(
         self,
@@ -289,7 +292,8 @@ class SmolVLM2Captioner:
         image: np.ndarray,
         regions: Optional[List[Any]],
         texts: Optional[List[Any]],
-        scene_model: Optional[str] = None
+        scene_model: Optional[str] = None,
+        precomputed_clip: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Synthesizes an open-ended, human-like scene description based on
@@ -365,7 +369,7 @@ class SmolVLM2Captioner:
         if max(h, w) >= 200 and c in (1, 3, 4):
             try:
                 from .scene_clip import get_mobileclip_analyzer
-                clip_res = get_mobileclip_analyzer(model_name=scene_model or self.scene_model).analyze(image)
+                clip_res = precomputed_clip if precomputed_clip is not None else get_mobileclip_analyzer(model_name=scene_model or self.scene_model).analyze(image)
                 if clip_res:
                     env = clip_res.get("environment", "")
                     env_sim = clip_res.get("environment_sim", 0.0)

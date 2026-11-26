@@ -108,6 +108,18 @@ class IMGSTDEncoder:
         original_size = int(image.nbytes)
         original_sha256 = IntegrityVerifier.compute_sha256(image) if include_residuals else "SEMANTIC_REF"
 
+        # Overlap MobileCLIP2 global scene analysis with region/OCR extraction when SmolVLM2 is off
+        clip_executor = None
+        clip_future = None
+        if self.version == "V04" and not self.enable_smolvlm2 and max(h, w) >= 200 and c in (1, 3, 4):
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+                from .scene_clip import get_mobileclip_analyzer
+                clip_executor = ThreadPoolExecutor(max_workers=1)
+                clip_future = clip_executor.submit(get_mobileclip_analyzer(model_name=self.scene_model).analyze, image)
+            except Exception:
+                clip_future = None
+
         # 2. Extract semantic regions, label map, and text layer
         t_sem_start = time.perf_counter()
         extract_result = self.extractor.extract(image)
@@ -157,10 +169,22 @@ class IMGSTDEncoder:
 
         # 8b. Keyframe Micro-VLM / MobileCLIP2 Scene & Region Captioning (V04)
         scene_desc = ""
+        precomputed_clip = None
+        if clip_future is not None:
+            try:
+                precomputed_clip = clip_future.result()
+            except Exception as exc:
+                logger.warning("Async MobileCLIP2 scene analysis failed (%s).", exc)
+            finally:
+                if clip_executor is not None:
+                    clip_executor.shutdown(wait=False)
         if self.version == "V04":
             try:
                 vlm = get_vlm_captioner(enable_neural=self.enable_smolvlm2, scene_model=self.scene_model)
-                scene_desc = vlm.caption_scene(image, regions=regions, texts=texts, scene_model=self.scene_model)
+                scene_desc = vlm.caption_scene(
+                    image, regions=regions, texts=texts,
+                    scene_model=self.scene_model, precomputed_clip=precomputed_clip
+                )
                 reg_attrs = vlm.describe_regions(image, regions=regions, label_map=label_map)
                 for r in regions:
                     if not getattr(r, "attributes", None) and r.region_id in reg_attrs:

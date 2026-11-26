@@ -29,6 +29,7 @@ vision = [
     "timm>=1.0.0",
     "safetensors>=0.4.0",
     "huggingface_hub>=0.25.0",
+    "onnx>=1.16.0,<1.19.0",
 ]
 neural = [
     "transformers>=4.45.0",

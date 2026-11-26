@@ -270,8 +270,11 @@ def download_model_weights(model_id: str, quiet: bool = False) -> Dict[str, Any]
     canon_id = normalize_scene_model_name(model_id)
     meta = MODEL_CATALOG[canon_id]
     was_cached = is_model_downloaded_locally(canon_id)
-    cache_file = os.path.join(get_weights_root(), meta["open_clip_name"], "prompt_bank_v1.npz")
-    if was_cached and os.path.exists(cache_file):
+    cache_dir = os.path.join(get_weights_root(), meta["open_clip_name"])
+    cache_file = os.path.join(cache_dir, "prompt_bank_v1.npz")
+    ts_file = os.path.join(cache_dir, "visual_model.ts")
+    onnx_file = os.path.join(cache_dir, "visual_model.onnx")
+    if was_cached and os.path.exists(cache_file) and (os.path.exists(onnx_file) or os.path.exists(ts_file)):
         return {"model_id": canon_id, "status": "already_ready", "downloaded": False, "path": cache_file, "elapsed_ms": 0.0}
 
     if not quiet:
@@ -309,13 +312,28 @@ def download_base_vision_models(quiet: bool = False) -> Dict[str, Any]:
     if not quiet:
         print(f"[*] Initializing core vision models in: {w_root}")
 
-    from .extractor import get_yolo_model, get_yolo_world_model
+    from .extractor import (
+        get_yolo_model,
+        get_hybrid_yolo_world_ort,
+        get_yolo_world_model,
+        _set_world_classes_cached,
+        YoloWorldSemanticExtractor,
+    )
     from .ocr import get_ocr_engine
 
     yolo = get_yolo_model("yolo11n-seg.pt")
     results["yolo11n-seg"] = "ready" if yolo is not None else "unavailable"
-    world = get_yolo_world_model("yolov8s-worldv2.pt")
-    results["yolov8s-worldv2"] = "ready" if world is not None else "unavailable"
+    world_ort = get_hybrid_yolo_world_ort(YoloWorldSemanticExtractor.HYBRID_OPEN_CLASSES, "yolov8s-worldv2.pt")
+    if world_ort is not None:
+        results["yolov8s-worldv2"] = "ready (onnx)"
+    else:
+        world = get_yolo_world_model("yolov8s-worldv2.pt")
+        if world is not None:
+            try:
+                _set_world_classes_cached(world, YoloWorldSemanticExtractor.HYBRID_OPEN_CLASSES)
+            except Exception:
+                pass
+        results["yolov8s-worldv2"] = "ready" if world is not None else "unavailable"
     ocr = get_ocr_engine()
     results["rapidocr"] = "ready" if ocr is not None else "unavailable"
 
