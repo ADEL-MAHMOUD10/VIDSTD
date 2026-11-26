@@ -274,15 +274,16 @@ def download_model_weights(model_id: str, quiet: bool = False) -> Dict[str, Any]
     cache_file = os.path.join(cache_dir, "prompt_bank_v1.npz")
     ts_file = os.path.join(cache_dir, "visual_model.ts")
     onnx_file = os.path.join(cache_dir, "visual_model.onnx")
-    if was_cached and os.path.exists(cache_file) and (os.path.exists(onnx_file) or os.path.exists(ts_file)):
+
+    from .scene_clip import get_mobileclip_analyzer
+    analyzer = get_mobileclip_analyzer(canon_id)
+    if was_cached and analyzer._load_prompt_bank_only(cache_file) and (os.path.exists(onnx_file) or os.path.exists(ts_file)):
         return {"model_id": canon_id, "status": "already_ready", "downloaded": False, "path": cache_file, "elapsed_ms": 0.0}
 
     if not quiet:
         msg = "Building prompt bank cache" if was_cached else f"Downloading {meta['open_clip_name']} ({meta['weights_size']})"
         print(f"[*] {msg} for '{canon_id}'...")
 
-    from .scene_clip import get_mobileclip_analyzer
-    analyzer = get_mobileclip_analyzer(canon_id)
     ok = analyzer._ensure_loaded()
     if not ok:
         raise RuntimeError(
