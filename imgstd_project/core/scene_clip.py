@@ -7,10 +7,12 @@ global environment, subject, and lighting understanding without VLM token genera
 
 import os
 import gc
+import json
 import time
 import hashlib
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+import warnings
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageOps
 
@@ -121,6 +123,8 @@ class MobileCLIPSceneAnalyzer:
         self.pretrained_tag = meta.get("pretrained_tag", "dfndr2b")
         self.weights_dir = weights_dir
         self._visual = None
+        self._ort_session = None
+        self._ort_input_name = None
         self._image_size = 256
         self._image_mean = (0.0, 0.0, 0.0)
         self._image_std = (1.0, 1.0, 1.0)
@@ -196,18 +200,131 @@ class MobileCLIPSceneAnalyzer:
         except Exception:
             return False
 
+    def _save_visual_meta(self, meta_path: str) -> None:
+        tmp_path = f"{meta_path}.tmp.{os.getpid()}"
+        meta = {
+            "open_clip_name": self.open_clip_name,
+            "image_size": int(self._image_size),
+            "image_mean": list(self._image_mean),
+            "image_std": list(self._image_std),
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        os.replace(tmp_path, meta_path)
+
+    def _load_visual_meta(self, meta_path: str) -> bool:
+        if not os.path.exists(meta_path):
+            return False
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if meta.get("open_clip_name") != self.open_clip_name:
+                return False
+            self._image_size = int(meta["image_size"])
+            self._image_mean = tuple(float(x) for x in meta["image_mean"][:3])
+            self._image_std = tuple(float(x) for x in meta["image_std"][:3])
+            return True
+        except Exception:
+            return False
+
+    def _try_load_cached_visual(self, cache_dir: str) -> bool:
+        meta_path = os.path.join(cache_dir, "visual_meta.json")
+        if not self._load_visual_meta(meta_path):
+            return False
+
+        # 1. Prefer ONNXRuntime visual cache if present (zero PyTorch import overhead)
+        onnx_path = os.path.join(cache_dir, "visual_model.onnx")
+        if os.path.exists(onnx_path):
+            try:
+                import onnxruntime as ort
+                sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+                self._ort_session = sess
+                self._ort_input_name = sess.get_inputs()[0].name
+                return True
+            except Exception as exc:
+                logger.debug("Cached visual ONNX load skipped (%s).", exc)
+                self._ort_session = None
+
+        # 2. Zero-open_clip TorchScript visual cache (~720ms vs ~8.4s open_clip/TimmModel cold init)
+        ts_path = os.path.join(cache_dir, "visual_model.ts")
+        if os.path.exists(ts_path) and _ensure_torch_imported():
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    vis_ts = torch.jit.load(ts_path, map_location="cpu")
+                vis_ts.eval()
+                self._visual = vis_ts
+                return True
+            except Exception as exc:
+                logger.debug("Cached visual TorchScript load skipped (%s).", exc)
+                self._visual = None
+
+        return False
+
+    def _export_visual_caches(self, cache_dir: str, vis: Any) -> None:
+        """Persists lightweight visual-only TorchScript (and ONNX when available) caches."""
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            meta_path = os.path.join(cache_dir, "visual_meta.json")
+            self._save_visual_meta(meta_path)
+
+            dummy = torch.zeros(1, 3, self._image_size, self._image_size, dtype=torch.float32)
+            ts_path = os.path.join(cache_dir, "visual_model.ts")
+            if not os.path.exists(ts_path):
+                tmp_ts = f"{ts_path}.tmp.{os.getpid()}"
+                try:
+                    with warnings.catch_warnings(), torch.no_grad():
+                        warnings.simplefilter("ignore")
+                        traced = torch.jit.trace(vis.eval(), dummy)
+                        torch.jit.save(traced, tmp_ts)
+                    os.replace(tmp_ts, ts_path)
+                except Exception as exc:
+                    if os.path.exists(tmp_ts):
+                        try:
+                            os.remove(tmp_ts)
+                        except OSError:
+                            pass
+                    logger.debug("Could not export TorchScript visual cache (%s).", exc)
+
+            onnx_path = os.path.join(cache_dir, "visual_model.onnx")
+            if not os.path.exists(onnx_path):
+                try:
+                    import onnx  # noqa: F401
+                    tmp_onnx = f"{onnx_path}.tmp.{os.getpid()}"
+                    with warnings.catch_warnings(), torch.no_grad():
+                        warnings.simplefilter("ignore")
+                        torch.onnx.export(
+                            vis.eval(),
+                            dummy,
+                            tmp_onnx,
+                            input_names=["image"],
+                            output_names=["embedding"],
+                            opset_version=17,
+                            do_constant_folding=True,
+                            dynamo=False,
+                        )
+                    os.replace(tmp_onnx, onnx_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _ensure_loaded(self) -> bool:
         if self._load_attempted:
-            return self._visual is not None and self._prompt_bank is not None
+            return (self._ort_session is not None or self._visual is not None) and self._prompt_bank is not None
         self._load_attempted = True
-
-        if not _ensure_torch_imported():
-            return False
 
         wdir = self._find_weights_dir()
         cache_dir = self._get_cache_dir()
         cache_path = os.path.join(cache_dir, "prompt_bank_v1.npz")
         bank_ready = self._load_prompt_bank_only(cache_path)
+
+        # Ultra-fast visual cache hit (skips open_clip/timm/safetensors completely)
+        if bank_ready and self._try_load_cached_visual(cache_dir):
+            return True
+
+        if not _ensure_torch_imported():
+            return False
 
         # Ultra-low-RAM fast path for local MobileCLIP2-S0 safetensors
         if self.open_clip_name == "MobileCLIP2-S0" and wdir is not None:
@@ -247,6 +364,7 @@ class MobileCLIPSceneAnalyzer:
                     vis.eval()
                     self._visual = vis
                     self._image_size = 256
+                    self._export_visual_caches(cache_dir, vis)
                     return True
                 except Exception:
                     self._visual = None
@@ -285,6 +403,7 @@ class MobileCLIPSceneAnalyzer:
             if bank_ready:
                 vis.eval()
                 self._visual = vis
+                self._export_visual_caches(cache_dir, vis)
                 return True
         except Exception as exc:
             logger.warning("Failed to load MobileCLIP2 variant '%s' (%s); falling back to geometric heuristics.", self.open_clip_name, exc)
@@ -292,7 +411,7 @@ class MobileCLIPSceneAnalyzer:
 
         return False
 
-    def _preprocess_full_width(self, image: np.ndarray) -> "torch.Tensor":
+    def _preprocess_full_width_np(self, image: np.ndarray) -> np.ndarray:
         """Strips cinema letterbox black bars and pads full-width to model input resolution."""
         arr = image
         if arr.ndim == 2:
@@ -317,7 +436,13 @@ class MobileCLIPSceneAnalyzer:
         mean = np.array(self._image_mean, dtype=np.float32)[:, None, None]
         std = np.array(self._image_std, dtype=np.float32)[:, None, None]
         ten = (ten - mean) / std
-        return torch.from_numpy(ten).unsqueeze(0)
+        return np.ascontiguousarray(ten[None, ...], dtype=np.float32)
+
+    def _preprocess_full_width(self, image: np.ndarray) -> "torch.Tensor":
+        ten_np = self._preprocess_full_width_np(image)
+        if not _ensure_torch_imported():
+            raise RuntimeError("PyTorch is required to build tensor input when ONNX cache is unavailable.")
+        return torch.from_numpy(ten_np)
 
     def analyze(self, image: np.ndarray) -> Optional[Dict[str, Any]]:
         """
@@ -328,11 +453,16 @@ class MobileCLIPSceneAnalyzer:
             return None
 
         t0 = time.perf_counter()
-        inp = self._preprocess_full_width(image)
-        with torch.no_grad():
-            feat = self._visual(inp)
-            feat = feat / feat.norm(dim=-1, keepdim=True)
-            img_vec = feat[0].cpu().numpy().astype(np.float32)
+        inp_np = self._preprocess_full_width_np(image)
+        if self._ort_session is not None:
+            raw_vec = self._ort_session.run(None, {self._ort_input_name: inp_np})[0][0].astype(np.float32)
+            norm = float(np.linalg.norm(raw_vec))
+            img_vec = raw_vec / max(1e-12, norm)
+        else:
+            with torch.no_grad():
+                feat = self._visual(torch.from_numpy(inp_np))
+                feat = feat / feat.norm(dim=-1, keepdim=True)
+                img_vec = feat[0].cpu().numpy().astype(np.float32)
 
         out: Dict[str, Any] = {"model": self.model_id}
         for ax, (labels, emb_mat) in self._prompt_bank.items():
