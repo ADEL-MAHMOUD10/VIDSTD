@@ -269,11 +269,13 @@ class TestStartupCacheFastPaths:
 
     def test_zero_torch_import_when_onnx_caches_exist(self, tmp_path):
         """When ONNX caches are populated in weights_dir, standard V04 extractors load ORT without PyTorch."""
-        import subprocess, sys
+        import hashlib, subprocess, sys
         from imgstd_project.core.config import get_weights_root
+        from imgstd_project.core.extractor import YoloWorldSemanticExtractor
 
+        sig = hashlib.sha256("\n".join(YoloWorldSemanticExtractor.HYBRID_OPEN_CLASSES).encode("utf-8")).hexdigest()[:16]
         mc_onnx = os.path.join(get_weights_root(), "MobileCLIP2-S0", "visual_model.onnx")
-        world_onnx = os.path.join(get_weights_root(), "yolov8s-worldv2_hybrid.onnx")
+        world_onnx = os.path.join(get_weights_root(), f"yolov8s-worldv2_hybrid_{sig}.onnx")
         if not (os.path.exists(mc_onnx) and os.path.exists(world_onnx)):
             pytest.skip("Local ONNX caches not yet generated on this runner.")
 
@@ -290,3 +292,26 @@ class TestStartupCacheFastPaths:
         )
         res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         assert res.returncode == 0, res.stderr
+
+    def test_event_calibration_and_vlm_resize_helper(self):
+        from imgstd_project.core.vlm_captioner import SmolVLM2Captioner
+        from imgstd_project.core.embedding import RegionEmbeddingGenerator
+
+        # Calm baseline must suppress weak noisy event hits
+        assert SmolVLM2Captioner.format_event_tag({"event": "calm", "event_sim": 0.30, "event_calm_sim": 0.30}) is None
+        assert SmolVLM2Captioner.format_event_tag({
+            "event": "combat or physical confrontation", "event_sim": 0.22, "event_calm_sim": 0.21
+        }) is None
+        # Clear event margin above calm passes
+        assert SmolVLM2Captioner.format_event_tag({
+            "event": "fire and rising smoke", "event_sim": 0.27, "event_calm_sim": 0.19
+        }) == "fire and rising smoke"
+
+        # Bounded resize helper prevents 1080p multi-tile explosion in SmolVLM2
+        big_img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        pil_resized = SmolVLM2Captioner._prepare_vlm_pil(big_img, max_side=512)
+        assert max(pil_resized.size) == 512
+
+        # Strided embedding preserves shape & dtype cleanly on 1080p crops
+        emb = RegionEmbeddingGenerator.compute(big_img, (0, 0, 1920, 1080))
+        assert emb.shape == (32,) and emb.dtype == np.int8
