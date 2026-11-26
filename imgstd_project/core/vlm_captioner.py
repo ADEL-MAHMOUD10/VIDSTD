@@ -111,6 +111,59 @@ class SmolVLM2Captioner:
             self._model = None
             self._processor = None
 
+    @staticmethod
+    def _prepare_vlm_pil(image: np.ndarray, max_side: int = 512):
+        """Resizes frame to bounded resolution so SmolVLM2 runs single-tile without 1080p token explosion."""
+        import cv2
+        from PIL import Image as PILImage
+        rgb = image[:, :, :3] if (image.ndim == 3 and image.shape[2] == 4) else image
+        if rgb.ndim == 2:
+            rgb = np.repeat(rgb[:, :, None], 3, axis=2)
+        h, w = rgb.shape[:2]
+        if max(h, w) > max_side:
+            scale = float(max_side) / float(max(h, w))
+            rgb = cv2.resize(rgb, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+        return PILImage.fromarray(rgb)
+
+    def _run_vlm_chat(self, prompt_text: str, pil_items: List[Any], is_video: bool = False, max_new_tokens: int = 56) -> Optional[str]:
+        media_key = "video" if is_video else "image"
+        messages = [{"role": "user", "content": [{"type": media_key}, {"type": "text", "text": prompt_text}]}]
+        prompt = self._processor.apply_chat_template(messages, add_generation_prompt=True)
+        proc_kwargs: Dict[str, Any] = {"text": prompt, "return_tensors": "pt", "do_image_splitting": False}
+        if is_video:
+            proc_kwargs["videos"] = [pil_items]
+        else:
+            proc_kwargs["images"] = pil_items
+        try:
+            inputs = self._processor(**proc_kwargs).to(self._device)
+        except TypeError:
+            proc_kwargs.pop("do_image_splitting", None)
+            inputs = self._processor(**proc_kwargs).to(self._device)
+
+        with torch.no_grad():
+            generated_ids = self._model.generate(**inputs, max_new_tokens=max_new_tokens)
+        trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+        desc = self._processor.batch_decode(trimmed, skip_special_tokens=True)[0]
+        if "Assistant:" in desc:
+            desc = desc.split("Assistant:", 1)[-1]
+        elif "assistant\n" in desc:
+            desc = desc.split("assistant\n", 1)[-1]
+        return desc.strip()
+
+    @staticmethod
+    def format_event_tag(clip_res: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Returns calibrated active event phrase only when it clearly exceeds the 'calm' baseline."""
+        if not clip_res:
+            return None
+        evt = str(clip_res.get("event", "") or "")
+        if not evt or evt == "calm":
+            return None
+        evt_sim = float(clip_res.get("event_sim", 0.0))
+        calm_sim = float(clip_res.get("event_calm_sim", 0.0))
+        if evt_sim >= 0.215 and (evt_sim - calm_sim) >= 0.022:
+            return evt
+        return None
+
     def caption_scene(
         self,
         image: np.ndarray,
@@ -127,34 +180,15 @@ class SmolVLM2Captioner:
 
         if self._model is not None and self._processor is not None:
             try:
-                import PIL.Image as PILImage
-                pil_img = PILImage.fromarray(image)
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "text", "text": "Describe this scene in detail, including open-world context, lighting/weather, detected subjects, and visible actions."}
-                        ]
-                    }
-                ]
-                prompt = self._processor.apply_chat_template(messages, add_generation_prompt=True)
-                inputs = self._processor(text=prompt, images=[pil_img], return_tensors="pt").to(self._device)
-                with torch.no_grad():
-                    generated_ids = self._model.generate(
-                        **inputs,
-                        max_new_tokens=128
-                    )
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                generated_text = self._processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
-                if "Assistant:" in generated_text:
-                    generated_text = generated_text.split("Assistant:", 1)[-1]
-                elif "assistant\n" in generated_text:
-                    generated_text = generated_text.split("assistant\n", 1)[-1]
-                if generated_text.strip():
-                    return generated_text.strip()
+                pil_img = self._prepare_vlm_pil(image, max_side=512)
+                desc = self._run_vlm_chat(
+                    "Describe clearly what is happening in this scene in 1 to 2 concise sentences without inventing unseen details.",
+                    [pil_img],
+                    is_video=False,
+                    max_new_tokens=56,
+                )
+                if desc and len(desc) >= 15:
+                    return desc
             except Exception as exc:
                 logger.warning("SmolVLM2 single-frame captioning failed (%s); falling back to heuristic.", exc)
 
@@ -171,8 +205,8 @@ class SmolVLM2Captioner:
         texts: Optional[List[Any]] = None
     ) -> str:
         """
-        Executes temporal video reasoning across a sampled burst of 4-8 representative frames.
-        Returns an open-ended natural language summary of actions, interactions, and temporal progression.
+        Executes fast single-tile temporal video reasoning across a sampled 4-frame burst.
+        Returns an open-ended natural language summary of actions, events, and scene progression.
         """
         if not frames:
             return "Empty video sequence."
@@ -181,39 +215,19 @@ class SmolVLM2Captioner:
 
         if self._model is not None and self._processor is not None:
             try:
-                import PIL.Image as PILImage
-                num_samples = min(8, max(4, len(frames)))
+                num_samples = min(4, len(frames))
                 indices = np.linspace(0, len(frames) - 1, num_samples).astype(int)
-                sampled_pil = [PILImage.fromarray(frames[idx]) for idx in indices]
-
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "video"},
-                            {"type": "text", "text": "Describe the dynamic actions, interactions, temporal movements, and scene progression in this video clip."}
-                        ]
-                    }
-                ]
-                prompt = self._processor.apply_chat_template(messages, add_generation_prompt=True)
-                inputs = self._processor(text=prompt, videos=[sampled_pil], return_tensors="pt").to(self._device)
-                with torch.no_grad():
-                    generated_ids = self._model.generate(
-                        **inputs,
-                        max_new_tokens=160
-                    )
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                generated_text = self._processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
-                if "Assistant:" in generated_text:
-                    generated_text = generated_text.split("Assistant:", 1)[-1]
-                elif "assistant\n" in generated_text:
-                    generated_text = generated_text.split("assistant\n", 1)[-1]
-                if generated_text.strip():
-                    return generated_text.strip()
+                sampled_pil = [self._prepare_vlm_pil(frames[idx], max_side=384) for idx in indices]
+                desc = self._run_vlm_chat(
+                    "Describe what happens across these frames cleanly in 1 to 2 sentences, focusing on real actions, objects, and key events.",
+                    sampled_pil,
+                    is_video=True,
+                    max_new_tokens=72,
+                )
+                if desc:
+                    return desc
             except Exception as exc:
-                logger.warning("SmolVLM2 single-frame captioning failed (%s); falling back to heuristic.", exc)
+                logger.warning("SmolVLM2 video clip captioning failed (%s); falling back to heuristic.", exc)
 
         # Fallback to temporal heuristic
         return self._heuristic_video_caption(frames, fps, regions, texts)
@@ -378,10 +392,11 @@ class SmolVLM2Captioner:
                     clip_light = clip_res.get("lighting", lighting)
                     txt_phrase = f' with visible text "{", ".join(real_signage[:2])}"' if real_signage else ""
 
-                    # Prevent MobileCLIP from hallucinating indoor/storefront when outdoor street objects are clearly detected
+                    # Prevent MobileCLIP from hallucinating indoor/UI/garage when outdoor street objects are clearly detected
                     street_cues = {"car", "bicycle", "traffic light", "bench", "truck", "bus", "motorcycle"}
                     if any(s in counts for s in street_cues) and not struct_names:
-                        if "storefront" in env or "indoor" in env or env_sim < 0.14:
+                        bad_street_envs = ("storefront", "indoor", "game", "software", "garage", "stage", "document")
+                        if any(b in env.lower() for b in bad_street_envs) or env_sim < 0.14:
                             env = "an outdoor urban street"
                             env_sim = max(env_sim, 0.20)
 
@@ -393,7 +408,10 @@ class SmolVLM2Captioner:
 
                     # Concrete YOLO entities take priority over speculative MobileCLIP subject guesses
                     if count_phrases:
-                        open_world_refines = ("rodent", "heavy industrial machine", "armored figures", "spacecraft")
+                        open_world_refines = (
+                            "rodent", "heavy industrial", "soldiers", "spacecraft",
+                            "helicopter", "athlete", "speaking", "worker", "performer",
+                        )
                         if len(class_names) == 1 and subj_sim >= 0.16 and any(k in subj for k in open_world_refines):
                             parts.append(f"featuring {subj}")
                         else:
@@ -401,7 +419,10 @@ class SmolVLM2Captioner:
                     elif subj_sim >= 0.16 and subj:
                         parts.append(f"featuring {subj}")
 
-                    return f"{', '.join(parts)} under {clip_light}{txt_phrase}."
+                    event_tag = self.format_event_tag(clip_res)
+                    event_clause = f" ({event_tag})" if event_tag else ""
+
+                    return f"{', '.join(parts)}{event_clause} under {clip_light}{txt_phrase}."
             except Exception:
                 pass
 
@@ -510,11 +531,15 @@ class SmolVLM2Captioner:
         aspect = bw / float(max(1, bh))
         cls_low = cls_name.lower()
 
-        # Select non-occluded mask pixels if available
+        # Select non-occluded mask pixels with spatial striding on large regions (avoids multi-million-pixel sort)
+        ch_c, cw_c = crop.shape[:2]
+        stride = max(1, max(ch_c, cw_c) // 96)
+        crop_s = crop[::stride, ::stride] if stride > 1 else crop
         if mask_crop is not None and mask_crop.shape[:2] == crop.shape[:2] and np.any(mask_crop):
-            pts = crop[mask_crop]
+            mc_s = mask_crop[::stride, ::stride] if stride > 1 else mask_crop
+            pts = crop_s[mc_s] if np.any(mc_s) else crop[mask_crop]
         else:
-            pts = crop.reshape(-1, crop.shape[2]) if crop.ndim == 3 else crop.reshape(-1)
+            pts = crop_s.reshape(-1, crop_s.shape[2]) if crop_s.ndim == 3 else crop_s.reshape(-1)
 
         attrs: List[str] = []
         if crop.ndim == 3 and crop.shape[2] >= 3 and len(pts) > 0:

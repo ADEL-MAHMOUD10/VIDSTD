@@ -149,14 +149,13 @@ class SceneCutDetector:
 
         self._frames_since_last_cut += 1
 
-        # Exact pixel match check (< 0.15 ms)
-        if np.array_equal(curr_frame, prev_frame):
-            return "S", 0.0
-
-        # Downscaled 64x64 MAD evaluation
+        # Evaluate 64x64 MAD first (avoids scanning 6.2MB+ on moving 1080p frames)
         curr_u8 = cv2.resize(curr_frame, (64, 64), interpolation=cv2.INTER_NEAREST)
         prev_u8 = cv2.resize(prev_frame, (64, 64), interpolation=cv2.INTER_NEAREST)
         mad = float(np.mean(np.abs(curr_u8.astype(np.int16) - prev_u8.astype(np.int16))))
+
+        if mad == 0.0 and np.array_equal(curr_frame, prev_frame):
+            return "S", 0.0
 
         if mad >= self.cut_threshold and self._frames_since_last_cut >= self.min_scene_len:
             if self.min_scene_len == 0 or mad >= 65.0 or self._hist_correlation(curr_u8, prev_u8) < 0.78:
@@ -388,6 +387,17 @@ class TemporalObjectTracker:
             return ""
 
         h, w = curr_frame.shape[:2]
+        # Downscale large HD/4K frames once per P-frame so matchTemplate runs in <1ms instead of ~45ms
+        track_scale = min(1.0, 320.0 / float(max(h, w))) if max(h, w) > 480 else 1.0
+        if track_scale < 1.0:
+            tw = max(32, int(round(w * track_scale)))
+            th = max(32, int(round(h * track_scale)))
+            curr_t = cv2.resize(curr_frame, (tw, th), interpolation=cv2.INTER_AREA)
+            prev_t = cv2.resize(prev_frame, (tw, th), interpolation=cv2.INTER_AREA)
+        else:
+            tw, th = w, h
+            curr_t, prev_t = curr_frame, prev_frame
+        win_pad_t = max(4, int(round(20 * track_scale)))
 
         for trk in self.tracks:
             # Only propagate active, moving OBJ tracks (not closed or static structures)
@@ -405,24 +415,23 @@ class TemporalObjectTracker:
                 trk.last_time_sec = curr_time
                 continue
 
-            # Crop template from prev_frame with safety bounds
-            y1, y2 = max(0, by), min(h, by + bh)
-            x1, x2 = max(0, bx), min(w, bx + bw)
-            tmpl = prev_frame[y1:y2, x1:x2]
+            # Map template & search window into fast proxy coordinates
+            x1 = max(0, int(round(bx * track_scale)))
+            y1 = max(0, int(round(by * track_scale)))
+            x2 = min(tw, max(x1 + 3, int(round((bx + bw) * track_scale))))
+            y2 = min(th, max(y1 + 3, int(round((by + bh) * track_scale))))
+            tmpl = prev_t[y1:y2, x1:x2]
 
-            # Search in a local window (+/- 20 px) in curr_frame
-            win_pad = 20
-            sy1, sy2 = max(0, y1 - win_pad), min(h, y2 + win_pad)
-            sx1, sx2 = max(0, x1 - win_pad), min(w, x2 + win_pad)
-            search_area = curr_frame[sy1:sy2, sx1:sx2]
+            sy1, sy2 = max(0, y1 - win_pad_t), min(th, y2 + win_pad_t)
+            sx1, sx2 = max(0, x1 - win_pad_t), min(tw, x2 + win_pad_t)
+            search_area = curr_t[sy1:sy2, sx1:sx2]
 
-            if search_area.shape[0] >= tmpl.shape[0] and search_area.shape[1] >= tmpl.shape[1]:
-                # Fast template match
+            if tmpl.size > 0 and search_area.shape[0] >= tmpl.shape[0] and search_area.shape[1] >= tmpl.shape[1]:
                 res = cv2.matchTemplate(search_area, tmpl, cv2.TM_SQDIFF_NORMED)
                 min_val, _, min_loc, _ = cv2.minMaxLoc(res)
                 if min_val < 0.25:
-                    new_x = sx1 + min_loc[0]
-                    new_y = sy1 + min_loc[1]
+                    new_x = max(0, min(w - bw, int(round((sx1 + min_loc[0]) / track_scale))))
+                    new_y = max(0, min(h - bh, int(round((sy1 + min_loc[1]) / track_scale))))
                     new_box = (new_x, new_y, bw, bh)
                     trk.current_box = new_box
                     trk.end_box = new_box

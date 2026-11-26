@@ -25,7 +25,8 @@ from .fast_b85 import b85encode, b85decode
 from .video_tracker import SceneCutDetector, TemporalObjectTracker
 from .media_io import FastMediaReader, FastMediaWriter, FastMediaStreamWriter
 from .ego_motion import CameraEgoMotionTracker
-from .vlm_captioner import get_vlm_captioner
+from .vlm_captioner import get_vlm_captioner, SmolVLM2Captioner
+from .scene_clip import get_mobileclip_analyzer
 
 
 class VideoEncoder:
@@ -62,7 +63,7 @@ class VideoEncoder:
         self._cctx = zstd.ZstdCompressor(level=1, threads=-1)
         self._v04_encoder = IMGSTDEncoder(
             version="V04", compression_level=1,
-            scene_model=self.scene_model, enable_smolvlm2=self.enable_smolvlm2
+            scene_model=self.scene_model, enable_smolvlm2=False
         )
         self._v02_encoder = IMGSTDEncoder(version="V02", compression_level=1)
 
@@ -156,23 +157,56 @@ class VideoEncoder:
         tmp_gop_path: Optional[str] = f"{output_path}.gop.tmp" if (output_path and not self.semantic_only) else None
         tmp_gop_file = open(tmp_gop_path, "wb") if tmp_gop_path else None
         scene_burst_frames: List[np.ndarray] = []
+        scene_start_f = 0
+        scene_open_conf = 0.0
+        scene_peak_mad = 0.0
+        scene_peak_frame_idx = -1
+        scene_peak_frame: Optional[np.ndarray] = None
 
-        def _finalize_scene_vlm_caption():
-            if self.enable_smolvlm2 and len(scene_burst_frames) >= 2 and tracker.scenes:
+        def _finalize_scene_vlm_caption(scene_end_f: int):
+            if not tracker.scenes:
+                return
+
+            peak_note = ""
+            if scene_peak_frame is not None and scene_peak_mad >= 14.0 and scene_peak_frame_idx > scene_start_f:
+                try:
+                    peak_clip = get_mobileclip_analyzer(scene_model=self.scene_model).analyze(scene_peak_frame)
+                    if peak_clip:
+                        peak_t = scene_peak_frame_idx / max(1.0, fps)
+                        evt = SmolVLM2Captioner.format_event_tag(peak_clip)
+                        existing_ctx = tracker.scenes[-1].context.lower()
+                        if evt and evt.lower() not in existing_ctx:
+                            peak_note = f" [Peak @ {peak_t:.2f}s: {evt}]"
+                except Exception as exc:
+                    logger.debug("Intra-scene peak CLIP check failed (%s).", exc)
+
+            sc_dur = max(0, scene_end_f - scene_start_f) / max(1.0, fps)
+            should_run_vlm = (
+                self.enable_smolvlm2
+                and len(scene_burst_frames) >= 2
+                and (scene_open_conf < 0.22 or scene_peak_mad >= 20.0 or sc_dur >= 3.0)
+            )
+            if should_run_vlm:
                 try:
                     vlm = get_vlm_captioner(enable_neural=True, scene_model=self.scene_model)
-                    clip_caption = vlm.caption_video_clip(scene_burst_frames, fps=fps)
+                    burst = list(scene_burst_frames)
+                    if scene_peak_frame is not None and len(burst) >= 2:
+                        burst.insert(len(burst) // 2, scene_peak_frame)
+                    clip_caption = vlm.caption_video_clip(burst[:4], fps=fps)
                     if clip_caption and "Empty video sequence" not in clip_caption:
                         tracker.scenes[-1].context = clip_caption
                 except Exception as exc:
                     logger.warning("SmolVLM2 clip captioning failed (%s); keeping MobileCLIP2/heuristic context.", exc)
 
+            if peak_note and peak_note.strip() not in tracker.scenes[-1].context:
+                tracker.scenes[-1].context = f"{tracker.scenes[-1].context}{peak_note}"
+
         def _record_scene_burst_frame(frm: np.ndarray):
             if not self.enable_smolvlm2:
                 return
-            if len(scene_burst_frames) < 8:
+            if len(scene_burst_frames) < 4:
                 scene_burst_frames.append(frm)
-            elif sampled_count % 4 == 0:
+            elif sampled_count % 3 == 0:
                 scene_burst_frames.pop(1)
                 scene_burst_frames.append(frm)
 
@@ -209,18 +243,28 @@ class VideoEncoder:
                 is_scene_cut = (decision == "CUT" and f_idx > 0)
 
                 if is_scene_cut:
-                    _finalize_scene_vlm_caption()
+                    _finalize_scene_vlm_caption(f_idx - 1)
                     scene_burst_frames.clear()
+                    scene_start_f = f_idx
+                    scene_open_conf = 0.0
+                    scene_peak_mad = 0.0
+                    scene_peak_frame_idx = -1
+                    scene_peak_frame = None
                     current_scene_num += 1
                     print(f"[*] Scene cut detected at frame {f_idx} ({f_idx / fps:.2f}s) -> Scene {current_scene_num:03d}", flush=True)
                     tracker.start_new_scene(f_idx, context=f"Scene cut {current_scene_num:03d}")
+                elif f_idx > scene_start_f and mad > scene_peak_mad:
+                    scene_peak_mad = mad
+                    scene_peak_frame_idx = f_idx
+                    scene_peak_frame = frame
 
                 _record_scene_burst_frame(frame)
 
                 if self.semantic_only:
                     if f_idx == 0 or is_scene_cut:
                         i_frame_count += 1
-                        v_code, _ = self._v04_encoder.encode(frame, include_residuals=False)
+                        v_code, enc_metrics = self._v04_encoder.encode(frame, include_residuals=False)
+                        scene_open_conf = float(enc_metrics.get("scene_confidence", 0.0))
                         insp = inspect_imgstd(v_code)
                         tracker.register_keyframe(
                             frame_idx=f_idx,
@@ -263,7 +307,8 @@ class VideoEncoder:
                     # -----------------------------------------------------
                     i_frame_count += 1
                     if f_idx == 0 or is_scene_cut:
-                        v_code, _ = self._v04_encoder.encode(frame)
+                        v_code, enc_metrics = self._v04_encoder.encode(frame)
+                        scene_open_conf = float(enc_metrics.get("scene_confidence", 0.0))
                         insp = inspect_imgstd(v_code)
                         tracker.register_keyframe(
                             frame_idx=f_idx,
@@ -330,8 +375,9 @@ class VideoEncoder:
                 tmp_gop_file = None
 
             duration_sec = round(total_frames / fps, 2) if total_frames > 0 else 0.0
-            _finalize_scene_vlm_caption()
+            _finalize_scene_vlm_caption(max(0, last_f_idx))
             scene_burst_frames.clear()
+            scene_peak_frame = None
             tracker.finalize(total_frames)
             sample_step = media_info.get("sample_step", 1)
             cam_events = cam_tracker.compile_timeline_events(sample_step=sample_step)
