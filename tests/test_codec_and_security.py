@@ -202,3 +202,91 @@ class TestMCPSandboxAndVLMTrust:
         src = open(path, "r", encoding="utf-8").read()
         assert "trust_remote_code=True" not in src
         assert "os.getcwd()" not in src
+
+
+class TestStartupCacheFastPaths:
+    def test_yolo_world_text_feature_cache_skips_repeat_clip(self, tmp_path, monkeypatch):
+        import types
+        import torch
+        from imgstd_project.core import config as cfg_mod
+        from imgstd_project.core.extractor import _set_world_classes_cached
+
+        monkeypatch.setattr(cfg_mod, "get_weights_root", lambda: str(tmp_path))
+
+        calls = {"count": 0}
+
+        class DummyWorld:
+            def __init__(self):
+                self.device = "cpu"
+                self.predictor = "stale"
+                self.model = types.SimpleNamespace(
+                    txt_feats=None,
+                    names=[],
+                    model=[types.SimpleNamespace(nc=0)],
+                )
+
+            def set_classes(self, classes):
+                calls["count"] += 1
+                self.model.txt_feats = torch.ones((1, len(classes), 4), dtype=torch.float32)
+                self.model.model[-1].nc = len(classes)
+                self.model.names = list(classes)
+                self.predictor = None
+
+        classes = ["soldier", "rodent"]
+        w1 = DummyWorld()
+        _set_world_classes_cached(w1, classes)
+        assert calls["count"] == 1
+
+        w2 = DummyWorld()
+        _set_world_classes_cached(w2, classes)
+        assert calls["count"] == 1  # Hit cache, no second CLIP encoding
+        assert w2.model.names == classes
+        assert w2.model.model[-1].nc == 2
+        assert w2.model.txt_feats.shape == (1, 2, 4)
+        assert w2.predictor is None
+
+    def test_mobileclip_visual_meta_and_torchscript_cache(self, tmp_path):
+        import json
+        from imgstd_project.core.scene_clip import MobileCLIPSceneAnalyzer
+
+        analyzer = MobileCLIPSceneAnalyzer("mobileclip2-s0", weights_dir=str(tmp_path))
+        meta_path = tmp_path / "visual_meta.json"
+        analyzer._image_size = 256
+        analyzer._image_mean = (0.1, 0.2, 0.3)
+        analyzer._image_std = (0.4, 0.5, 0.6)
+        analyzer._save_visual_meta(str(meta_path))
+
+        loaded = MobileCLIPSceneAnalyzer("mobileclip2-s0", weights_dir=str(tmp_path))
+        loaded._image_size = 128
+        assert loaded._load_visual_meta(str(meta_path)) is True
+        assert loaded._image_size == 256
+        assert loaded._image_mean == (0.1, 0.2, 0.3)
+        assert loaded._image_std == (0.4, 0.5, 0.6)
+
+        # Wrong model signature must reject stale metadata
+        wrong = MobileCLIPSceneAnalyzer("mobileclip2-s2", weights_dir=str(tmp_path))
+        assert wrong._load_visual_meta(str(meta_path)) is False
+
+    def test_zero_torch_import_when_onnx_caches_exist(self, tmp_path):
+        """When ONNX caches are populated in weights_dir, standard V04 extractors load ORT without PyTorch."""
+        import subprocess, sys
+        from imgstd_project.core.config import get_weights_root
+
+        mc_onnx = os.path.join(get_weights_root(), "MobileCLIP2-S0", "visual_model.onnx")
+        world_onnx = os.path.join(get_weights_root(), "yolov8s-worldv2_hybrid.onnx")
+        if not (os.path.exists(mc_onnx) and os.path.exists(world_onnx)):
+            pytest.skip("Local ONNX caches not yet generated on this runner.")
+
+        out_file = str(tmp_path / "ort_test.imgstd")
+        img_file = str(tmp_path / "ort_in.png")
+        cv2.imwrite(img_file, np.full((256, 256, 3), 120, dtype=np.uint8))
+
+        code = (
+            "import sys; "
+            "from imgstd_project.core.encoder import encode_image; "
+            f"encode_image(r'{img_file}', output_path=r'{out_file}', enable_smolvlm2=False); "
+            "assert 'torch' not in sys.modules, 'Unexpected PyTorch import in ONNX path!'; "
+            "assert 'open_clip' not in sys.modules"
+        )
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr

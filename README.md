@@ -50,8 +50,9 @@ Measured on Windows 11, 12-core x86_64 CPU-only (`PyTorch CPU`), comparing stand
 | Workload | Resolution | Raw Size | PNG Size | IMGSTD Size | vs PNG | vs Raw | Encode Time | Inspect (`O(1)`) | Decode Time | MSE |
 |---|---|---|---|---|---|---|---|---|---|---|
 | Synthetic UI (`FastColorSegmenter`) | `256x256` | `196,608 B` | `1,156 B` | `962 B` | `0.83x` | `204.37x` | `6.81 s` (incl. cold CLIP load) | `11.38 ms` | `3.2 ms` | `0.0` |
-| Street Photo (`Hybrid YOLO+CLIP+OCR`) | `1024x576` | `1,769,472 B` | `930,733 B` | `938,989 B` | `1.01x` | `1.88x` | `4.84 s` (warm models) | `12.07 ms` | `32.7 ms` | `0.0` |
+| Street Photo (`Hybrid YOLO+CLIP+OCR`) | `1024x576` | `1,769,472 B` | `930,733 B` | `938,897 B` | `1.01x` | `1.885x` | `1.74–1.88 s` (cold ONNX CLI) | `0.40–1.20 ms` | `26.73 ms` | `0.0` |
 | Noisy Gradient (`FastColorSegmenter`) | `1920x1080` | `6,220,800 B` | `3,708,949 B` | `5,111,602 B` | `1.38x` | `1.22x` | `352.1 ms` | `15.83 ms` | `139.2 ms` | `0.0` |
+| Video Semantic Ref (`vid-ref`, 805f / 2.0 FPS) | `1920x1080` | — | — | `1.4 KB` | — | — | `5.34 s` (cold ONNX CLI, 2 I-frames + 73 P) | `~1 ms` | — | — |
 
 > **Honest Storage Note**: Full pixel-lossless `.imgstd` embeds residuals as ASCII `Base85` (+25% text expansion) over Zstandard, so on high-entropy photos `.imgstd` is roughly `1.0x–1.38x` the size of a binary PNG. For videos you already keep locally, use **`vidstd vid-ref`** (`MODE:SEMANTIC_REF`), which strips pixel residuals and produces **`~1.4–20 KB`** AI reference timelines (`1.4 KB` observed for 805 frames @ 1080p).
 
