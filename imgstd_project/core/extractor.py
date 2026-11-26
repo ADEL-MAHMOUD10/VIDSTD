@@ -16,7 +16,7 @@ import cv2
 
 from .ocr import FastSceneOCR, TextDescriptor
 from .embedding import RegionEmbeddingGenerator
-from .vocab_maps import COCO_CLASS_ID_MAP, OPEN_VOCAB_MAP
+from .vocab_maps import COCO_CLASS_ID_MAP, COCO_CLASS_NAMES, OPEN_VOCAB_MAP
 
 logger = logging.getLogger("imgstd.extractor")
 
@@ -102,12 +102,21 @@ _CACHED_YOLO_MODEL = None
 
 class OpenCVDNNYoloSeg:
     """
-    Ultra-fast native OpenCV DNN runner for YOLO11-seg ONNX models.
-    Operates in ~40-70ms on CPU with zero PyTorch / Ultralytics dependencies.
-    Uses aspect-ratio preserving letterboxing and class-aware associative recovery.
+    Ultra-fast ONNX runner for YOLO11-seg models (prefers ORT CPUExecutionProvider,
+    falls back to OpenCV DNN). Operates in ~80-110ms on CPU with zero PyTorch /
+    Ultralytics dependencies, using aspect-ratio preserving letterboxing.
     """
     def __init__(self, onnx_path: str = "yolo11n-seg.onnx"):
-        self.net = cv2.dnn.readNetFromONNX(onnx_path)
+        self._ort_session = None
+        self._ort_input_name = None
+        self.net = None
+        try:
+            import onnxruntime as ort
+            sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+            self._ort_session = sess
+            self._ort_input_name = sess.get_inputs()[0].name
+        except Exception:
+            self.net = cv2.dnn.readNetFromONNX(onnx_path)
 
     def predict(
         self,
@@ -126,9 +135,14 @@ class OpenCVDNNYoloSeg:
         dy = (imgsz - nh) // 2
         canvas[dy:dy+nh, dx:dx+nw] = cv2.resize(image, (nw, nh))
 
-        blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (imgsz, imgsz), swapRB=True)
-        self.net.setInput(blob)
-        outs = self.net.forward(['output0', 'output1'])
+        if self._ort_session is not None:
+            blob_ort = canvas[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) * (1.0 / 255.0)
+            blob_ort = np.ascontiguousarray(blob_ort[None])
+            outs = self._ort_session.run(None, {self._ort_input_name: blob_ort})
+        else:
+            blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (imgsz, imgsz), swapRB=True)
+            self.net.setInput(blob)
+            outs = self.net.forward(['output0', 'output1'])
         out0 = outs[0][0]   # (116, 8400)
         proto = outs[1][0]  # (32, 160, 160)
 
@@ -247,9 +261,19 @@ def _configure_ultralytics_weights_dir() -> str:
 
 
 def get_yolo_model(model_path: str = "yolo11n-seg.pt") -> Any:
-    """Lazy singleton loader for YOLO11n-seg model (auto-downloads via Ultralytics or falls back to ONNX)."""
+    """Lazy singleton loader for YOLO11n-seg (prefers cached ONNX runtime for fast cold startup)."""
     global _CACHED_YOLO_MODEL
     if _CACHED_YOLO_MODEL is None:
+        onnx_name = model_path.replace(".pt", ".onnx") if model_path.endswith(".pt") else "yolo11n-seg.onnx"
+        resolved_onnx = _resolve_weight_path(onnx_name) or _resolve_weight_path("yolo11n-seg.onnx")
+        if resolved_onnx:
+            try:
+                _CACHED_YOLO_MODEL = OpenCVDNNYoloSeg(resolved_onnx)
+                return _CACHED_YOLO_MODEL
+            except Exception as exc_onnx:
+                logger.warning("ONNX YOLO11n-seg load failed (%s); falling back to PyTorch weights.", exc_onnx)
+                _CACHED_YOLO_MODEL = None
+
         w_root = _configure_ultralytics_weights_dir()
         resolved_pt = _resolve_weight_path(model_path)
         target_pt = resolved_pt or os.path.join(w_root, os.path.basename(model_path))
@@ -258,7 +282,7 @@ def get_yolo_model(model_path: str = "yolo11n-seg.pt") -> Any:
             # Pass bare filename when missing so Ultralytics auto-downloads directly into weights_dir
             _CACHED_YOLO_MODEL = YOLO(resolved_pt if resolved_pt else os.path.basename(model_path))
         except Exception as exc:
-            logger.warning("Failed to load Ultralytics YOLO model '%s' (%s); trying ONNX fallback.", model_path, exc)
+            logger.warning("Failed to load Ultralytics YOLO model '%s' (%s).", model_path, exc)
             _CACHED_YOLO_MODEL = None
             if not resolved_pt and os.path.exists(target_pt):
                 try:
@@ -267,20 +291,51 @@ def get_yolo_model(model_path: str = "yolo11n-seg.pt") -> Any:
                 except Exception as exc2:
                     logger.warning("Fallback YOLO load '%s' failed (%s).", target_pt, exc2)
                     _CACHED_YOLO_MODEL = None
-
-        # Seamless fallback to native OpenCV DNN ONNX runner
-        if _CACHED_YOLO_MODEL is None:
-            onnx_name = model_path.replace(".pt", ".onnx") if model_path.endswith(".pt") else "yolo11n-seg.onnx"
-            resolved_onnx = _resolve_weight_path(onnx_name) or _resolve_weight_path("yolo11n-seg.onnx")
-            if resolved_onnx:
-                try:
-                    _CACHED_YOLO_MODEL = OpenCVDNNYoloSeg(resolved_onnx)
-                except Exception as exc3:
-                    logger.warning("OpenCV DNN YOLO ONNX fallback failed (%s).", exc3)
     return _CACHED_YOLO_MODEL
 
 
 _CACHED_STRUCT_MODEL = None
+
+
+def _set_world_classes_cached(world_model: Any, classes: List[str]) -> None:
+    """Sets YOLO-World classes using cached CLIP text features when available to skip loading ViT-B-32.pt (~338MB)."""
+    import hashlib
+    from .config import get_weights_root
+
+    sig = hashlib.sha256("\n".join(classes).encode("utf-8")).hexdigest()[:16]
+    cache_path = os.path.join(get_weights_root(), f"world_txt_{sig}.npz")
+
+    if os.path.exists(cache_path):
+        try:
+            import torch
+            data = np.load(cache_path, allow_pickle=False)
+            cached_cls = data["classes"].tolist()
+            if list(cached_cls) == list(classes):
+                feats = np.ascontiguousarray(data["txt_feats"], dtype=np.float32)
+                dev = getattr(world_model, "device", "cpu")
+                world_model.model.txt_feats = torch.from_numpy(feats).to(dev)
+                world_model.model.model[-1].nc = len(classes)
+                world_model.model.names = list(classes)
+                world_model.predictor = None
+                return
+        except Exception as exc:
+            logger.debug("YOLO-World text feature cache miss (%s); computing via CLIP.", exc)
+
+    world_model.set_classes(classes)
+    try:
+        txt_feats = getattr(world_model.model, "txt_feats", None)
+        if txt_feats is not None:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+            with open(tmp_path, "wb") as fh:
+                np.savez_compressed(
+                    fh,
+                    classes=np.array(list(classes)),
+                    txt_feats=txt_feats.detach().cpu().numpy().astype(np.float32),
+                )
+            os.replace(tmp_path, cache_path)
+    except Exception:
+        pass
 
 
 def get_structural_model(model_path: str = "yolov8s-worldv2.pt") -> Any:
@@ -300,7 +355,7 @@ def get_structural_model(model_path: str = "yolov8s-worldv2.pt") -> Any:
             )
             m = YOLO(resolved if resolved else os.path.basename(model_path))
             if hasattr(m, "set_classes"):
-                m.set_classes([
+                _set_world_classes_cached(m, [
                     "storefront", "door", "window", "stairs", "signboard", "wall", "pavement"
                 ])
             _CACHED_STRUCT_MODEL = m
@@ -859,6 +914,126 @@ class FastColorSegmenter(BaseSemanticExtractor):
 # OPEN_VOCAB_MAP imported from .vocab_maps
 
 _CACHED_WORLD_MODEL = None
+_CACHED_WORLD_HYBRID_ORT: Dict[str, "ORTYoloWorld"] = {}
+
+
+class ORTYoloWorld:
+    """
+    PyTorch-free ONNXRuntime runner for fixed-vocabulary YOLO-World hybrid models.
+    Pre-bakes class text embeddings inside the ONNX graph so cold CLI runs skip
+    importing torch, ultralytics, and CLIP ViT-B-32 entirely.
+    """
+
+    def __init__(self, onnx_path: str):
+        import onnxruntime as ort
+        self._sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        self._input_name = self._sess.get_inputs()[0].name
+
+    def predict_boxes(
+        self,
+        image: np.ndarray,
+        imgsz: int = 640,
+        conf: float = 0.42,
+        iou: float = 0.45,
+    ) -> List[Dict[str, Any]]:
+        h_orig, w_orig = image.shape[:2]
+        scale = min(imgsz / w_orig, imgsz / h_orig)
+        nw, nh = int(round(w_orig * scale)), int(round(h_orig * scale))
+        canvas = np.full((imgsz, imgsz, 3), 114, dtype=np.uint8)
+        dx = (imgsz - nw) // 2
+        dy = (imgsz - nh) // 2
+        canvas[dy:dy + nh, dx:dx + nw] = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+        blob = np.ascontiguousarray(
+            canvas[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) * (1.0 / 255.0)
+        )
+        out = self._sess.run(None, {self._input_name: blob})[0][0].T  # (8400, 4 + C)
+        boxes = out[:, :4]
+        scores = out[:, 4:]
+        cls_ids = np.argmax(scores, axis=1)
+        max_scores = np.max(scores, axis=1)
+
+        keep = max_scores >= conf
+        if not np.any(keep):
+            return []
+
+        boxes = boxes[keep]
+        cls_ids = cls_ids[keep]
+        max_scores = max_scores[keep]
+
+        x1 = (boxes[:, 0] - boxes[:, 2] * 0.5 - dx) / scale
+        y1 = (boxes[:, 1] - boxes[:, 3] * 0.5 - dy) / scale
+        bw = boxes[:, 2] / scale
+        bh = boxes[:, 3] / scale
+
+        cv_boxes = [[float(x1[i]), float(y1[i]), float(bw[i]), float(bh[i])] for i in range(len(boxes))]
+        indices = cv2.dnn.NMSBoxes(cv_boxes, max_scores.tolist(), conf, iou)
+        if len(indices) == 0:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        for idx in np.asarray(indices).reshape(-1):
+            i = int(idx)
+            bx = int(max(0, min(w_orig - 1, round(x1[i]))))
+            by = int(max(0, min(h_orig - 1, round(y1[i]))))
+            x2 = int(max(bx + 1, min(w_orig, round(x1[i] + bw[i]))))
+            y2 = int(max(by + 1, min(h_orig, round(y1[i] + bh[i]))))
+            results.append({
+                "xyxy": (bx, by, x2, y2),
+                "cls_idx": int(cls_ids[i]),
+                "conf": float(max_scores[i]),
+            })
+        return results
+
+
+def get_hybrid_yolo_world_ort(
+    classes: List[str],
+    weights_path: str = "yolov8s-worldv2.pt",
+) -> Optional[ORTYoloWorld]:
+    """
+    Returns an ONNXRuntime runner for fixed open-vocabulary classes, exporting once
+    from the PyTorch YOLO-World checkpoint when `onnx` is installed.
+    """
+    import hashlib
+    from .config import get_weights_root
+
+    sig = hashlib.sha256("\n".join(classes).encode("utf-8")).hexdigest()[:16]
+    if sig in _CACHED_WORLD_HYBRID_ORT:
+        return _CACHED_WORLD_HYBRID_ORT[sig]
+
+    w_root = get_weights_root()
+    tagged_onnx = os.path.join(w_root, f"yolov8s-worldv2_hybrid_{sig}.onnx")
+    legacy_onnx = os.path.join(w_root, "yolov8s-worldv2_hybrid.onnx")
+
+    # Adopt existing un-hashed hybrid ONNX if present for HYBRID_OPEN_CLASSES
+    onnx_path = tagged_onnx if os.path.exists(tagged_onnx) else (
+        legacy_onnx if (os.path.exists(legacy_onnx) and list(classes) == list(YoloWorldSemanticExtractor.HYBRID_OPEN_CLASSES)) else tagged_onnx
+    )
+
+    if os.path.exists(onnx_path):
+        try:
+            runner = ORTYoloWorld(onnx_path)
+            _CACHED_WORLD_HYBRID_ORT[sig] = runner
+            return runner
+        except Exception as exc:
+            logger.debug("Cached YOLO-World ONNX load skipped (%s).", exc)
+
+    # Auto-export once if onnx package & PyTorch model are available
+    try:
+        import onnx  # noqa: F401
+        wm = get_yolo_world_model(weights_path)
+        if wm is not None:
+            _set_world_classes_cached(wm, classes)
+            exported_path = wm.export(format="onnx", imgsz=640, opset=17, simplify=False)
+            if exported_path and os.path.exists(exported_path):
+                os.makedirs(w_root, exist_ok=True)
+                os.replace(exported_path, tagged_onnx)
+                runner = ORTYoloWorld(tagged_onnx)
+                _CACHED_WORLD_HYBRID_ORT[sig] = runner
+                return runner
+    except Exception as exc:
+        logger.debug("YOLO-World ONNX auto-export skipped (%s).", exc)
+    return None
 
 
 def get_yolo_world_model(weights_path: str = "yolov8s-worldv2.pt"):
@@ -935,7 +1110,7 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
         model = get_yolo_world_model(self.model_path)
         if model is not None:
             try:
-                model.set_classes(self.active_classes)
+                _set_world_classes_cached(model, self.active_classes)
                 self._model_classes_set = True
             except Exception:
                 pass
@@ -957,13 +1132,25 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
         """
         Extracts open-vocabulary semantic regions from image with anti-hallucination guarantees.
         """
+        from concurrent.futures import ThreadPoolExecutor
+
         h_orig, w_orig = image.shape[:2]
         c = image.shape[2] if len(image.shape) > 2 else 1
         total_pixels = h_orig * w_orig
 
-        # 1. OCR Layer
-        texts = self.ocr.extract(image)
-        self.last_texts = texts
+        # Run RapidOCR asynchronously while celestial check + YOLO11n-seg execute
+        ocr_executor = ThreadPoolExecutor(max_workers=1)
+        ocr_future = ocr_executor.submit(self.ocr.extract, image)
+
+        def _collect_ocr(fallback: Optional[List[TextDescriptor]] = None) -> List[TextDescriptor]:
+            try:
+                res = ocr_future.result()
+                return res if (res or fallback is None) else fallback
+            except Exception as exc:
+                logger.warning("Async OCR extraction failed (%s).", exc)
+                return fallback or []
+            finally:
+                ocr_executor.shutdown(wait=False)
 
         # 2. Celestial & Deep Space Analysis (Strict void + circularity, letterbox-aware)
         content_slice = image
@@ -1070,6 +1257,8 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
                 role="BACKGROUND",
                 embedding=bg_emb
             )
+            texts = _collect_ocr()
+            self.last_texts = texts
             return [cr, bg_region], label_map, color_lut, texts
 
         image_pred = image[:, :, :3] if (image.ndim == 3 and image.shape[2] == 4) else image
@@ -1095,11 +1284,16 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
                             bw, bh = int(np.max(xs) - bx + 1), int(np.max(ys) - by + 1)
                             c_idx = int(inst.get("cls_idx", 0))
                             cls_id = COCO_CLASS_ID_MAP.get(c_idx, f"{c_idx + 1:04d}")
-                            raw_nm = f"object_{c_idx}"
+                            raw_nm = COCO_CLASS_NAMES.get(c_idx, f"object_{c_idx}")
+                            v_info = OPEN_VOCAB_MAP.get(raw_nm)
                             candidates.append({
                                 "mask": m, "bbox": (bx, by, bw, bh), "area": int(np.count_nonzero(m)),
-                                "cls_id": cls_id, "raw_name": raw_nm, "cls_name": None,
-                                "category": None, "conf": float(inst.get("conf", 0.5)), "source": "coco_seg"
+                                "cls_id": v_info[0] if v_info else cls_id,
+                                "raw_name": raw_nm,
+                                "cls_name": v_info[1] if v_info else raw_nm.title(),
+                                "category": v_info[2] if v_info else None,
+                                "conf": float(inst.get("conf", 0.5)),
+                                "source": "coco_seg"
                             })
                     else:
                         seg_preds = yolo_seg.predict(image_pred, imgsz=self.imgsz, conf=coco_conf, iou=self.iou, agnostic_nms=True, verbose=False)
@@ -1141,65 +1335,80 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
                 except Exception as exc:
                     logger.warning("YOLO11n-seg hybrid inference failed (%s).", exc)
 
-            # Targeted non-COCO open-vocabulary supplement (never duplicates standard COCO detections)
-            world_model = get_yolo_world_model(self.model_path)
-            if world_model is not None:
+            # Targeted non-COCO open-vocabulary supplement (prefers PyTorch-free ONNXRuntime cache)
+            ow_conf = max(0.42, float(self.conf))
+            ow_dets: List[Tuple[Tuple[int, int, int, int], int, float]] = []
+            ort_world = get_hybrid_yolo_world_ort(self.HYBRID_OPEN_CLASSES, self.model_path)
+            if ort_world is not None:
                 try:
-                    if not self._model_classes_set or self.active_classes != self.HYBRID_OPEN_CLASSES:
-                        world_model.set_classes(self.HYBRID_OPEN_CLASSES)
-                        self.active_classes = list(self.HYBRID_OPEN_CLASSES)
-                        self._model_classes_set = True
-
-                    ow_conf = max(0.42, float(self.conf))
-                    w_preds = world_model.predict(image_pred, imgsz=self.imgsz, conf=ow_conf, iou=self.iou, agnostic_nms=True, verbose=False)
-                    if w_preds and len(w_preds) > 0 and w_preds[0].boxes is not None and len(w_preds[0].boxes) > 0:
-                        boxes = w_preds[0].boxes
-                        xyxy = boxes.xyxy.cpu().numpy()
-                        cls_indices = boxes.cls.cpu().numpy().astype(int)
-                        conf_scores = boxes.conf.cpu().numpy()
-                        for i in range(len(cls_indices)):
-                            x1, y1, x2, y2 = [int(v) for v in xyxy[i]]
-                            bx = max(0, min(w_orig - 1, x1))
-                            by = max(0, min(h_orig - 1, y1))
-                            bw = max(1, min(w_orig - bx, x2 - x1))
-                            bh = max(1, min(h_orig - by, y2 - y1))
-                            ow_box = (bx, by, bw, bh)
-                            raw_nm = self.HYBRID_OPEN_CLASSES[cls_indices[i]] if cls_indices[i] < len(self.HYBRID_OPEN_CLASSES) else "object"
-                            v_info = OPEN_VOCAB_MAP.get(raw_nm.lower(), ("0899", raw_nm.title(), "General"))
-
-                            # If 'rodent' overlaps a low-conf COCO bird/cat/dog/bear, refine label while preserving pixel mask
-                            refined = False
-                            for cand in candidates:
-                                iou_val = self._box_iou(ow_box, cand["bbox"])
-                                if raw_nm == "rodent" and cand["cls_id"] in ("0016", "0017", "0018", "0023") and cand["conf"] < 0.72 and iou_val >= 0.35:
-                                    cand["cls_id"], cand["cls_name"], cand["category"] = v_info
-                                    cand["raw_name"] = raw_nm
-                                    refined = True
-                                    break
-                            if refined:
-                                continue
-
-                            # Skip open-vocab detections overlapping COCO instances (or humans wearing gear -> Soldier refinement stays if no high-conf COCO overlap)
-                            if any(self._box_iou(ow_box, c["bbox"]) >= 0.30 for c in candidates):
-                                continue
-
-                            m = np.zeros((h_orig, w_orig), dtype=bool)
-                            m[by:by + bh, bx:bx + bw] = True
-                            candidates.append({
-                                "mask": m, "bbox": ow_box, "area": bw * bh,
-                                "cls_id": v_info[0], "raw_name": raw_nm,
-                                "cls_name": v_info[1], "category": v_info[2],
-                                "conf": float(conf_scores[i]), "source": "open_vocab"
-                            })
+                    for det in ort_world.predict_boxes(image_pred, imgsz=self.imgsz, conf=ow_conf, iou=self.iou):
+                        ow_dets.append((det["xyxy"], det["cls_idx"], det["conf"]))
                 except Exception as exc:
-                    logger.warning("YOLO11n-seg hybrid inference failed (%s).", exc)
+                    logger.warning("YOLO-World ONNX inference failed (%s); falling back to PyTorch.", exc)
+                    ow_dets = []
+                    ort_world = None
+
+            if ort_world is None:
+                world_model = get_yolo_world_model(self.model_path)
+                if world_model is not None:
+                    try:
+                        if not self._model_classes_set or self.active_classes != self.HYBRID_OPEN_CLASSES:
+                            _set_world_classes_cached(world_model, self.HYBRID_OPEN_CLASSES)
+                            self.active_classes = list(self.HYBRID_OPEN_CLASSES)
+                            self._model_classes_set = True
+
+                        w_preds = world_model.predict(image_pred, imgsz=self.imgsz, conf=ow_conf, iou=self.iou, agnostic_nms=True, verbose=False)
+                        if w_preds and len(w_preds) > 0 and w_preds[0].boxes is not None and len(w_preds[0].boxes) > 0:
+                            boxes = w_preds[0].boxes
+                            xyxy = boxes.xyxy.cpu().numpy()
+                            cls_indices = boxes.cls.cpu().numpy().astype(int)
+                            conf_scores = boxes.conf.cpu().numpy()
+                            for i in range(len(cls_indices)):
+                                x1, y1, x2, y2 = [int(v) for v in xyxy[i]]
+                                ow_dets.append(((x1, y1, x2, y2), int(cls_indices[i]), float(conf_scores[i])))
+                    except Exception as exc:
+                        logger.warning("YOLO-World hybrid inference failed (%s).", exc)
+
+            for (x1, y1, x2, y2), c_idx, c_score in ow_dets:
+                bx = max(0, min(w_orig - 1, x1))
+                by = max(0, min(h_orig - 1, y1))
+                bw = max(1, min(w_orig - bx, x2 - x1))
+                bh = max(1, min(h_orig - by, y2 - y1))
+                ow_box = (bx, by, bw, bh)
+                raw_nm = self.HYBRID_OPEN_CLASSES[c_idx] if c_idx < len(self.HYBRID_OPEN_CLASSES) else "object"
+                v_info = OPEN_VOCAB_MAP.get(raw_nm.lower(), ("0899", raw_nm.title(), "General"))
+
+                # If 'rodent' overlaps a low-conf COCO bird/cat/dog/bear, refine label while preserving pixel mask
+                refined = False
+                for cand in candidates:
+                    iou_val = self._box_iou(ow_box, cand["bbox"])
+                    if raw_nm == "rodent" and cand["cls_id"] in ("0016", "0017", "0018", "0023") and cand["conf"] < 0.72 and iou_val >= 0.35:
+                        cand["cls_id"], cand["cls_name"], cand["category"] = v_info
+                        cand["raw_name"] = raw_nm
+                        refined = True
+                        break
+                if refined:
+                    continue
+
+                # Skip open-vocab detections overlapping COCO instances (or humans wearing gear -> Soldier refinement stays if no high-conf COCO overlap)
+                if any(self._box_iou(ow_box, c["bbox"]) >= 0.30 for c in candidates):
+                    continue
+
+                m = np.zeros((h_orig, w_orig), dtype=bool)
+                m[by:by + bh, bx:bx + bw] = True
+                candidates.append({
+                    "mask": m, "bbox": ow_box, "area": bw * bh,
+                    "cls_id": v_info[0], "raw_name": raw_nm,
+                    "cls_name": v_info[1], "category": v_info[2],
+                    "conf": float(c_score), "source": "open_vocab"
+                })
         else:
             # Explicit custom vocabulary path
             world_model = get_yolo_world_model(self.model_path)
             if world_model is not None:
                 try:
                     if not self._model_classes_set:
-                        world_model.set_classes(self.active_classes)
+                        _set_world_classes_cached(world_model, self.active_classes)
                         self._model_classes_set = True
                     preds = world_model.predict(image_pred, imgsz=self.imgsz, conf=self.conf, iou=self.iou, agnostic_nms=True, verbose=False)
                     if preds and len(preds) > 0 and len(preds[0].boxes) > 0:
@@ -1307,10 +1516,14 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
                     embedding=bg_emb
                 ))
 
+            texts = _collect_ocr()
+            self.last_texts = texts
             return results, label_map, color_lut, texts
 
         # 4. Fallback chain (abstract / solid / non-object images -> honest BG)
-        regs, l_map, c_lut, texts = self.fallback_extractor.extract(image)
+        regs, l_map, c_lut, fb_texts = self.fallback_extractor.extract(image)
+        texts = _collect_ocr(fallback=fb_texts)
+        self.last_texts = texts
         # Compute embeddings for fallback regions
         for r in regs:
             if r.embedding is None:
