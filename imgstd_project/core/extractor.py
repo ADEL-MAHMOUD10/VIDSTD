@@ -21,6 +21,21 @@ from .vocab_maps import COCO_CLASS_ID_MAP, COCO_CLASS_NAMES, OPEN_VOCAB_MAP
 logger = logging.getLogger("imgstd.extractor")
 
 
+def _fast_masked_median_color(image: np.ndarray, mask: np.ndarray, channels: int) -> List[int]:
+    """Computes representative median RGB/Gray color using fast strided subsampling on large masks."""
+    h, w = mask.shape[:2]
+    if h * w > 65536:
+        step = 4
+        pts = image[::step, ::step][mask[::step, ::step]]
+        if pts.size == 0:
+            pts = image[mask]
+    else:
+        pts = image[mask]
+    if pts.size == 0:
+        return [128] * channels
+    return np.median(pts, axis=0).astype(int).tolist()[:channels]
+
+
 @dataclass
 class RegionDescriptor:
     region_id: str
@@ -1003,31 +1018,26 @@ def get_hybrid_yolo_world_ort(
 
     w_root = get_weights_root()
     tagged_onnx = os.path.join(w_root, f"yolov8s-worldv2_hybrid_{sig}.onnx")
-    legacy_onnx = os.path.join(w_root, "yolov8s-worldv2_hybrid.onnx")
 
-    # Adopt existing un-hashed hybrid ONNX if present for HYBRID_OPEN_CLASSES
-    onnx_path = tagged_onnx if os.path.exists(tagged_onnx) else (
-        legacy_onnx if (os.path.exists(legacy_onnx) and list(classes) == list(YoloWorldSemanticExtractor.HYBRID_OPEN_CLASSES)) else tagged_onnx
-    )
-
-    if os.path.exists(onnx_path):
+    if os.path.exists(tagged_onnx):
         try:
-            runner = ORTYoloWorld(onnx_path)
+            runner = ORTYoloWorld(tagged_onnx)
             _CACHED_WORLD_HYBRID_ORT[sig] = runner
             return runner
         except Exception as exc:
             logger.debug("Cached YOLO-World ONNX load skipped (%s).", exc)
 
-    # Auto-export once if onnx package & PyTorch model are available
+    # Cross-drive safe move into portable weights cache
     try:
         import onnx  # noqa: F401
+        import shutil
         wm = get_yolo_world_model(weights_path)
         if wm is not None:
             _set_world_classes_cached(wm, classes)
             exported_path = wm.export(format="onnx", imgsz=640, opset=17, simplify=False)
             if exported_path and os.path.exists(exported_path):
                 os.makedirs(w_root, exist_ok=True)
-                os.replace(exported_path, tagged_onnx)
+                shutil.move(exported_path, tagged_onnx)
                 runner = ORTYoloWorld(tagged_onnx)
                 _CACHED_WORLD_HYBRID_ORT[sig] = runner
                 return runner
@@ -1077,10 +1087,23 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
         "bed", "dining table", "cell phone", "laptop", "book", "clock"
     ]
 
-    # Compact non-COCO open-vocabulary targets used cleanly alongside YOLO11n-seg without class dilution
+    # Balanced cross-domain non-COCO open-vocabulary supplement (hazards, architecture, gear, craft, fauna, UI)
     HYBRID_OPEN_CLASSES: List[str] = [
-        "heavy machinery", "spaceship", "soldier", "rodent", "chart", "diagram"
+        "fire", "explosion", "smoke",
+        "door", "stairs", "signboard", "bridge",
+        "helmet", "camera", "microphone", "guitar", "tool",
+        "helicopter", "construction excavator", "heavy machinery", "spacecraft",
+        "fish", "rodent", "soldier", "chart", "diagram",
     ]
+
+    # Uniform subclass refinement mapping: open_vocab_name -> (parent_coco_ids, max_parent_conf)
+    _OPEN_VOCAB_REFINEMENTS: Dict[str, Tuple[Tuple[str, ...], float]] = {
+        "rodent": (("0016", "0017", "0018", "0023"), 0.72),
+        "helicopter": (("0005",), 0.78),
+        "spacecraft": (("0005",), 0.78),
+        "construction excavator": (("0008",), 0.75),
+        "heavy machinery": (("0008",), 0.72),
+    }
 
     def __init__(
         self,
@@ -1131,26 +1154,16 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
     ) -> Tuple[List[RegionDescriptor], np.ndarray, np.ndarray, List[TextDescriptor]]:
         """
         Extracts open-vocabulary semantic regions from image with anti-hallucination guarantees.
+        Runs ONNX sessions sequentially so ORT's internal CPU thread pools avoid oversubscription thrashing.
         """
-        from concurrent.futures import ThreadPoolExecutor
-
         h_orig, w_orig = image.shape[:2]
         c = image.shape[2] if len(image.shape) > 2 else 1
         total_pixels = h_orig * w_orig
+        image_pred_early = image[:, :, :3] if (image.ndim == 3 and image.shape[2] == 4) else image
 
-        # Run RapidOCR asynchronously while celestial check + YOLO11n-seg execute
-        ocr_executor = ThreadPoolExecutor(max_workers=1)
-        ocr_future = ocr_executor.submit(self.ocr.extract, image)
-
-        def _collect_ocr(fallback: Optional[List[TextDescriptor]] = None) -> List[TextDescriptor]:
-            try:
-                res = ocr_future.result()
-                return res if (res or fallback is None) else fallback
-            except Exception as exc:
-                logger.warning("Async OCR extraction failed (%s).", exc)
-                return fallback or []
-            finally:
-                ocr_executor.shutdown(wait=False)
+        # 1. OCR Layer (sequential ORT avoids multi-session CPU thread contention)
+        texts = self.ocr.extract(image)
+        self.last_texts = texts
 
         # 2. Celestial & Deep Space Analysis (Strict void + circularity, letterbox-aware)
         content_slice = image
@@ -1257,11 +1270,9 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
                 role="BACKGROUND",
                 embedding=bg_emb
             )
-            texts = _collect_ocr()
-            self.last_texts = texts
             return [cr, bg_region], label_map, color_lut, texts
 
-        image_pred = image[:, :, :3] if (image.ndim == 3 and image.shape[2] == 4) else image
+        image_pred = image_pred_early
 
         # 3. Hybrid Inference:
         #    - Standard scenes: YOLO11n-seg (true pixel masks + high COCO recall) + non-COCO open-vocab extras.
@@ -1378,20 +1389,23 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
                 raw_nm = self.HYBRID_OPEN_CLASSES[c_idx] if c_idx < len(self.HYBRID_OPEN_CLASSES) else "object"
                 v_info = OPEN_VOCAB_MAP.get(raw_nm.lower(), ("0899", raw_nm.title(), "General"))
 
-                # If 'rodent' overlaps a low-conf COCO bird/cat/dog/bear, refine label while preserving pixel mask
+                # Refine overlapping COCO candidates uniformly where open-vocab adds subclass precision (keeps pixel mask)
                 refined = False
-                for cand in candidates:
-                    iou_val = self._box_iou(ow_box, cand["bbox"])
-                    if raw_nm == "rodent" and cand["cls_id"] in ("0016", "0017", "0018", "0023") and cand["conf"] < 0.72 and iou_val >= 0.35:
-                        cand["cls_id"], cand["cls_name"], cand["category"] = v_info
-                        cand["raw_name"] = raw_nm
-                        refined = True
-                        break
+                ref_rule = self._OPEN_VOCAB_REFINEMENTS.get(raw_nm)
+                if ref_rule is not None:
+                    parent_ids, max_parent_conf = ref_rule
+                    for cand in candidates:
+                        if cand["cls_id"] in parent_ids and cand["conf"] < max_parent_conf and self._box_iou(ow_box, cand["bbox"]) >= 0.35:
+                            cand["cls_id"], cand["cls_name"], cand["category"] = v_info
+                            cand["raw_name"] = raw_nm
+                            refined = True
+                            break
                 if refined:
                     continue
 
-                # Skip open-vocab detections overlapping COCO instances (or humans wearing gear -> Soldier refinement stays if no high-conf COCO overlap)
-                if any(self._box_iou(ow_box, c["bbox"]) >= 0.30 for c in candidates):
+                # Hazards (fire, explosion, smoke) can co-exist around vehicles/buildings; only dedup tight self-overlaps
+                overlap_thresh = 0.65 if raw_nm in ("fire", "explosion", "smoke") else 0.30
+                if any(self._box_iou(ow_box, c["bbox"]) >= overlap_thresh for c in candidates):
                     continue
 
                 m = np.zeros((h_orig, w_orig), dtype=bool)
@@ -1458,8 +1472,7 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
                 bx, by, bw, bh = cand["bbox"]
                 area = int(np.count_nonzero(cand["mask"]))
                 cov_pct = round((area / total_pixels) * 100.0, 2)
-                pts = image[vis_mask]
-                dom_col = np.median(pts, axis=0).astype(int).tolist()[:c] if pts.size > 0 else [128] * c
+                dom_col = _fast_masked_median_color(image, vis_mask, c)
                 color_lut[label_id] = dom_col
 
                 emb = RegionEmbeddingGenerator.compute(image, (bx, by, bw, bh), vis_mask)
@@ -1493,7 +1506,7 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
             if np.any(bg_mask):
                 bg_label = len(results) + 1
                 label_map[bg_mask] = bg_label
-                bg_col = np.median(image[bg_mask], axis=0).astype(int).tolist()[:c]
+                bg_col = _fast_masked_median_color(image, bg_mask, c)
                 color_lut[bg_label] = bg_col
                 bg_cls = "0206" if is_deep_space else ("0901" if np.mean(bg_col[:3]) < 45 else "0900")
                 bg_name = "Outer Space / Deep Space (Celestial)" if is_deep_space else "Ambient Background"
@@ -1516,13 +1529,11 @@ class YoloWorldSemanticExtractor(BaseSemanticExtractor):
                     embedding=bg_emb
                 ))
 
-            texts = _collect_ocr()
-            self.last_texts = texts
             return results, label_map, color_lut, texts
 
         # 4. Fallback chain (abstract / solid / non-object images -> honest BG)
         regs, l_map, c_lut, fb_texts = self.fallback_extractor.extract(image)
-        texts = _collect_ocr(fallback=fb_texts)
+        texts = texts or fb_texts
         self.last_texts = texts
         # Compute embeddings for fallback regions
         for r in regs:
